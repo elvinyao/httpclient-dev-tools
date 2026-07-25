@@ -5,18 +5,13 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping as MappingABC
+from collections.abc import AsyncIterator, Awaitable, Iterator, Mapping
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import (
     Any,
-    Awaitable,
     Callable,
-    Dict,
-    Mapping,
     NoReturn,
-    Optional,
-    Type,
     Union,
 )
 
@@ -24,7 +19,6 @@ import httpx
 
 from .config import HttpClientConfig, RetryPolicy, RetryRule
 from .exceptions import BaseHttpError, NonReplayableRequestError
-
 
 Sleep = Callable[[float], None]
 AsyncSleep = Callable[[float], Awaitable[None]]
@@ -41,10 +35,7 @@ def _config_from_value(config: ConfigInput) -> HttpClientConfig:
 
 def _method_can_ever_retry(policy: RetryPolicy, method: str) -> bool:
     normalized = method.upper()
-    return any(
-        rule.max_attempts > 1 and normalized in rule.retry_methods
-        for rule in policy.rules
-    )
+    return any(rule.max_attempts > 1 and normalized in rule.retry_methods for rule in policy.rules)
 
 
 def _is_one_shot(value: Any) -> bool:
@@ -60,7 +51,7 @@ def _is_one_shot(value: Any) -> bool:
 
 
 def _files_are_replayable(files: Any) -> bool:
-    if isinstance(files, MappingABC):
+    if isinstance(files, Mapping):
         values = list(files.values())
     elif isinstance(files, (list, tuple)):
         values = []
@@ -82,7 +73,7 @@ def _files_are_replayable(files: Any) -> bool:
     return True
 
 
-def _non_replayable_body_reason(kwargs: Mapping[str, Any]) -> Optional[str]:
+def _non_replayable_body_reason(kwargs: Mapping[str, Any]) -> str | None:
     content = kwargs.get("content")
     if content is not None and _is_one_shot(content):
         return "content is a one-shot iterator or stream"
@@ -101,7 +92,7 @@ def _non_replayable_body_reason(kwargs: Mapping[str, Any]) -> Optional[str]:
 def _reject_non_replayable_body(
     policy: RetryPolicy,
     method: str,
-    url: Union[str, httpx.URL],
+    url: str | httpx.URL,
     kwargs: Mapping[str, Any],
 ) -> None:
     if not _method_can_ever_retry(policy, method):
@@ -112,11 +103,7 @@ def _reject_non_replayable_body(
 
     safe_url = _safe_url(url)
     raise NonReplayableRequestError(
-        "{} {} cannot be retried safely: {}".format(
-            method.upper(),
-            safe_url,
-            reason,
-        ),
+        f"{method.upper()} {safe_url} cannot be retried safely: {reason}",
         method=method.upper(),
         url=safe_url,
         attempts=0,
@@ -125,12 +112,12 @@ def _reject_non_replayable_body(
 
 def _request_details(
     fallback_method: str,
-    fallback_url: Union[str, httpx.URL],
+    fallback_url: str | httpx.URL,
     *,
-    response: Optional[httpx.Response] = None,
-    error: Optional[Exception] = None,
+    response: httpx.Response | None = None,
+    error: Exception | None = None,
 ) -> tuple[str, str]:
-    request: Optional[httpx.Request] = None
+    request: httpx.Request | None = None
     if response is not None:
         request = response.request
     elif isinstance(error, httpx.RequestError):
@@ -141,7 +128,7 @@ def _request_details(
     return fallback_method.upper(), _safe_url(fallback_url)
 
 
-def _safe_url(url: Union[str, httpx.URL]) -> str:
+def _safe_url(url: str | httpx.URL) -> str:
     """Remove credentials, query values, and fragments from error metadata."""
 
     try:
@@ -161,9 +148,9 @@ def _safe_url(url: Union[str, httpx.URL]) -> str:
 
 
 def _retry_after_seconds(
-    response: Optional[httpx.Response],
+    response: httpx.Response | None,
     now: Now,
-) -> Optional[float]:
+) -> float | None:
     if response is None:
         return None
 
@@ -195,15 +182,11 @@ def _retry_after_seconds(
 def _delay(
     rule: RetryRule,
     retry_number: int,
-    response: Optional[httpx.Response],
+    response: httpx.Response | None,
     random_value: RandomValue,
     now: Now,
 ) -> float:
-    retry_after = (
-        _retry_after_seconds(response, now)
-        if rule.backoff.respect_retry_after
-        else None
-    )
+    retry_after = _retry_after_seconds(response, now) if rule.backoff.respect_retry_after else None
     return rule.backoff.delay_for_retry(
         retry_number,
         retry_after=retry_after,
@@ -212,14 +195,14 @@ def _delay(
 
 
 def _raise_failure(
-    error_type: Type[BaseHttpError],
+    error_type: type[BaseHttpError],
     *,
     fallback_method: str,
-    fallback_url: Union[str, httpx.URL],
+    fallback_url: str | httpx.URL,
     attempts: int,
-    rule: Optional[RetryRule],
-    response: Optional[httpx.Response] = None,
-    cause: Optional[Exception] = None,
+    rule: RetryRule | None,
+    response: httpx.Response | None = None,
+    cause: Exception | None = None,
 ) -> NoReturn:
     method, url = _request_details(
         fallback_method,
@@ -229,15 +212,10 @@ def _raise_failure(
     )
     status_code = response.status_code if response is not None else None
     rule_name = rule.name if rule is not None else None
-    retry_exhausted = (
-        rule is not None
-        and rule.max_attempts > 1
-        and method.upper() in rule.retry_methods
-        and attempts >= rule.max_attempts
-    )
+    retry_exhausted = rule is not None and rule.max_attempts > 1 and method.upper() in rule.retry_methods and attempts >= rule.max_attempts
 
     if status_code is not None:
-        reason = "HTTP {}".format(status_code)
+        reason = f"HTTP {status_code}"
     elif cause is not None:
         reason = type(cause).__name__
     else:
@@ -273,7 +251,7 @@ class HttpClient:
         self,
         config: ConfigInput,
         *,
-        transport: Optional[httpx.BaseTransport] = None,
+        transport: httpx.BaseTransport | None = None,
         sleep: Sleep = time.sleep,
         random_value: RandomValue = random.random,
         now: Now = lambda: datetime.now(timezone.utc),
@@ -283,7 +261,7 @@ class HttpClient:
         self._random_value = random_value
         self._now = now
 
-        client_options: Dict[str, Any] = {
+        client_options: dict[str, Any] = {
             "timeout": self.config.timeout,
             "headers": self.config.headers,
             "follow_redirects": self.config.follow_redirects,
@@ -303,7 +281,7 @@ class HttpClient:
     def request(
         self,
         method: str,
-        url: Union[str, httpx.URL],
+        url: str | httpx.URL,
         **kwargs: Any,
     ) -> httpx.Response:
         attempt = 0
@@ -329,9 +307,7 @@ class HttpClient:
                         self._sleep(delay)
                     continue
 
-                error_type = (
-                    rule.raise_as if rule is not None else policy.default_system_error
-                )
+                error_type = rule.raise_as if rule is not None else policy.default_system_error
                 _raise_failure(
                     error_type,
                     fallback_method=normalized_method,
@@ -385,25 +361,25 @@ class HttpClient:
                 response=response,
             )
 
-    def get(self, url: Union[str, httpx.URL], **kwargs: Any) -> httpx.Response:
+    def get(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self.request("GET", url, **kwargs)
 
-    def post(self, url: Union[str, httpx.URL], **kwargs: Any) -> httpx.Response:
+    def post(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self.request("POST", url, **kwargs)
 
-    def put(self, url: Union[str, httpx.URL], **kwargs: Any) -> httpx.Response:
+    def put(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self.request("PUT", url, **kwargs)
 
-    def patch(self, url: Union[str, httpx.URL], **kwargs: Any) -> httpx.Response:
+    def patch(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self.request("PATCH", url, **kwargs)
 
-    def delete(self, url: Union[str, httpx.URL], **kwargs: Any) -> httpx.Response:
+    def delete(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return self.request("DELETE", url, **kwargs)
 
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> "HttpClient":
+    def __enter__(self) -> HttpClient:
         return self
 
     def __exit__(self, *args: Any) -> None:
@@ -417,7 +393,7 @@ class AsyncHttpClient:
         self,
         config: ConfigInput,
         *,
-        transport: Optional[httpx.AsyncBaseTransport] = None,
+        transport: httpx.AsyncBaseTransport | None = None,
         sleep: AsyncSleep = asyncio.sleep,
         random_value: RandomValue = random.random,
         now: Now = lambda: datetime.now(timezone.utc),
@@ -427,7 +403,7 @@ class AsyncHttpClient:
         self._random_value = random_value
         self._now = now
 
-        client_options: Dict[str, Any] = {
+        client_options: dict[str, Any] = {
             "timeout": self.config.timeout,
             "headers": self.config.headers,
             "follow_redirects": self.config.follow_redirects,
@@ -445,7 +421,7 @@ class AsyncHttpClient:
     async def request(
         self,
         method: str,
-        url: Union[str, httpx.URL],
+        url: str | httpx.URL,
         **kwargs: Any,
     ) -> httpx.Response:
         attempt = 0
@@ -475,9 +451,7 @@ class AsyncHttpClient:
                         await self._sleep(delay)
                     continue
 
-                error_type = (
-                    rule.raise_as if rule is not None else policy.default_system_error
-                )
+                error_type = rule.raise_as if rule is not None else policy.default_system_error
                 _raise_failure(
                     error_type,
                     fallback_method=normalized_method,
@@ -531,35 +505,25 @@ class AsyncHttpClient:
                 response=response,
             )
 
-    async def get(
-        self, url: Union[str, httpx.URL], **kwargs: Any
-    ) -> httpx.Response:
+    async def get(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)
 
-    async def post(
-        self, url: Union[str, httpx.URL], **kwargs: Any
-    ) -> httpx.Response:
+    async def post(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return await self.request("POST", url, **kwargs)
 
-    async def put(
-        self, url: Union[str, httpx.URL], **kwargs: Any
-    ) -> httpx.Response:
+    async def put(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return await self.request("PUT", url, **kwargs)
 
-    async def patch(
-        self, url: Union[str, httpx.URL], **kwargs: Any
-    ) -> httpx.Response:
+    async def patch(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return await self.request("PATCH", url, **kwargs)
 
-    async def delete(
-        self, url: Union[str, httpx.URL], **kwargs: Any
-    ) -> httpx.Response:
+    async def delete(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
         return await self.request("DELETE", url, **kwargs)
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def __aenter__(self) -> "AsyncHttpClient":
+    async def __aenter__(self) -> AsyncHttpClient:
         return self
 
     async def __aexit__(self, *args: Any) -> None:

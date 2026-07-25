@@ -20,62 +20,64 @@ pip install -e .
 from resilient_http import HttpClient, HttpClientConfig
 
 
-config = HttpClientConfig.from_dict({
-    "base_url": "https://api.example.com",
-    "timeout": {
-        "connect": 3,
-        "read": 20,
-    },
-    "retry": {
-        "rules": [
-            {
-                "name": "rate-limit",
-                "status_codes": [429],
-                "max_attempts": 5,
-                "backoff": {
-                    "initial": 1,
-                    "multiplier": 2,
-                    "max": 30,
-                    "jitter": 0.5,
-                    "respect_retry_after": True,
+config = HttpClientConfig.from_dict(
+    {
+        "base_url": "https://api.example.com",
+        "timeout": {
+            "connect": 3,
+            "read": 20,
+        },
+        "retry": {
+            "rules": [
+                {
+                    "name": "rate-limit",
+                    "status_codes": [429],
+                    "max_attempts": 5,
+                    "backoff": {
+                        "initial": 1,
+                        "multiplier": 2,
+                        "max": 30,
+                        "jitter": 0.5,
+                        "respect_retry_after": True,
+                    },
+                    "raise_as": "system",
                 },
-                "raise_as": "system",
-            },
-            {
-                "name": "server-error",
-                "status_codes": [500, 502, 503, 504],
-                "max_attempts": 3,
-                "backoff": {
-                    "initial": 0.5,
-                    "multiplier": 2,
-                    "max": 10,
+                {
+                    "name": "server-error",
+                    "status_codes": [500, 502, 503, 504],
+                    "max_attempts": 3,
+                    "backoff": {
+                        "initial": 0.5,
+                        "multiplier": 2,
+                        "max": 10,
+                    },
+                    "raise_as": "system",
                 },
-                "raise_as": "system",
-            },
-            {
-                "name": "network-error",
-                "exceptions": [
-                    "ConnectTimeout",
-                    "ReadTimeout",
-                    "ConnectError",
-                ],
-                "max_attempts": 4,
-                "backoff": {
-                    "initial": 0.5,
-                    "multiplier": 2,
-                    "max": 10,
+                {
+                    "name": "network-error",
+                    "exceptions": [
+                        "ConnectTimeout",
+                        "ReadTimeout",
+                        "ConnectError",
+                    ],
+                    "max_attempts": 4,
+                    "backoff": {
+                        "initial": 0.5,
+                        "multiplier": 2,
+                        "max": 10,
+                    },
+                    "raise_as": "system",
                 },
-                "raise_as": "system",
-            },
-            {
-                "name": "known-client-error",
-                "status_codes": [400, 401, 403, 404],
-                "max_attempts": 1,
-                "raise_as": "business",
-            },
-        ]
-    },
-})
+                {
+                    "name": "known-client-error",
+                    "status_codes": [400, 401, 403, 404],
+                    "max_attempts": 1,
+                    "raise_as": "business",
+                },
+            ]
+        },
+    }
+)
 
 with HttpClient(config) as client:
     response = client.get("/users/123")
@@ -236,3 +238,13 @@ async with AsyncHttpClient(config) as client:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## 代码质量
+
+```bash
+pip install -e ".[dev]"
+ruff format .
+ruff check .
+```
+
+Ruff 配置统一维护在 `pyproject.toml`。

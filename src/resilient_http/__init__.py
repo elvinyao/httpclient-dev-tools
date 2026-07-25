@@ -16,11 +16,11 @@ from .exceptions import (
 )
 
 __all__ = [
+    "DEFAULT_RETRY_METHODS",
     "AsyncHttpClient",
     "BackoffConfig",
     "BaseHttpError",
     "BusinessHttpError",
-    "DEFAULT_RETRY_METHODS",
     "HttpClient",
     "HttpClientConfig",
     "NonReplayableRequestError",

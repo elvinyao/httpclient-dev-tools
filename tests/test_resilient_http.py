@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
-from typing import List
 
 import httpx
 
@@ -33,9 +32,7 @@ class UpstreamUnavailable(SystemHttpError):
 
 class HttpClientTests(unittest.TestCase):
     def test_success_returns_httpx_response(self) -> None:
-        transport = httpx.MockTransport(
-            lambda request: httpx.Response(200, json={"ok": True})
-        )
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
         with HttpClient(config_with(), transport=transport) as client:
             response = client.get("/health")
 
@@ -43,9 +40,7 @@ class HttpClientTests(unittest.TestCase):
         self.assertEqual(response.json(), {"ok": True})
 
     def test_client_accepts_configuration_dict_directly(self) -> None:
-        transport = httpx.MockTransport(
-            lambda request: httpx.Response(200, json={"ok": True})
-        )
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
         with HttpClient(
             {
                 "base_url": "https://example.test",
@@ -60,7 +55,7 @@ class HttpClientTests(unittest.TestCase):
 
     def test_status_rule_controls_attempts_and_backoff(self) -> None:
         calls = 0
-        sleeps: List[float] = []
+        sleeps: list[float] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal calls
@@ -128,17 +123,17 @@ class HttpClientTests(unittest.TestCase):
             retry_policy=policy,
         )
 
-        with HttpClient(
-            config, transport=httpx.MockTransport(make_handler(429))
-        ) as client:
-            with self.assertRaises(SystemHttpError):
-                client.get("/")
+        with (
+            HttpClient(config, transport=httpx.MockTransport(make_handler(429))) as client,
+            self.assertRaises(SystemHttpError),
+        ):
+            client.get("/")
 
-        with HttpClient(
-            config, transport=httpx.MockTransport(make_handler(503))
-        ) as client:
-            with self.assertRaises(SystemHttpError):
-                client.get("/")
+        with (
+            HttpClient(config, transport=httpx.MockTransport(make_handler(503))) as client,
+            self.assertRaises(SystemHttpError),
+        ):
+            client.get("/")
 
         self.assertEqual(counts, {429: 5, 503: 2})
 
@@ -150,11 +145,11 @@ class HttpClientTests(unittest.TestCase):
             calls += 1
             return httpx.Response(403)
 
-        with HttpClient(
-            config_with(), transport=httpx.MockTransport(handler)
-        ) as client:
-            with self.assertRaises(BusinessHttpError) as caught:
-                client.get("/admin")
+        with (
+            HttpClient(config_with(), transport=httpx.MockTransport(handler)) as client,
+            self.assertRaises(BusinessHttpError) as caught,
+        ):
+            client.get("/admin")
 
         self.assertEqual(calls, 1)
         self.assertEqual(caught.exception.status_code, 403)
@@ -169,11 +164,11 @@ class HttpClientTests(unittest.TestCase):
             calls += 1
             return httpx.Response(501)
 
-        with HttpClient(
-            config_with(), transport=httpx.MockTransport(handler)
-        ) as client:
-            with self.assertRaises(SystemHttpError) as caught:
-                client.get("/unsupported")
+        with (
+            HttpClient(config_with(), transport=httpx.MockTransport(handler)) as client,
+            self.assertRaises(SystemHttpError) as caught,
+        ):
+            client.get("/unsupported")
 
         self.assertEqual(calls, 1)
         self.assertEqual(caught.exception.status_code, 501)
@@ -193,12 +188,14 @@ class HttpClientTests(unittest.TestCase):
             max_attempts=3,
             backoff=BackoffConfig(initial_delay=0, max_delay=0),
         )
-        with HttpClient(
-            config_with(default_rule),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(SystemHttpError) as caught:
-                client.post("/orders", json={"amount": 100})
+        with (
+            HttpClient(
+                config_with(default_rule),
+                transport=httpx.MockTransport(handler),
+            ) as client,
+            self.assertRaises(SystemHttpError) as caught,
+        ):
+            client.post("/orders", json={"amount": 100})
 
         self.assertEqual(calls, 1)
         self.assertEqual(caught.exception.attempts, 1)
@@ -211,12 +208,14 @@ class HttpClientTests(unittest.TestCase):
             retry_methods=frozenset({"POST"}),
             backoff=BackoffConfig(initial_delay=0, max_delay=0),
         )
-        with HttpClient(
-            config_with(post_rule),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(SystemHttpError) as caught:
-                client.post("/orders", json={"amount": 100})
+        with (
+            HttpClient(
+                config_with(post_rule),
+                transport=httpx.MockTransport(handler),
+            ) as client,
+            self.assertRaises(SystemHttpError) as caught,
+        ):
+            client.post("/orders", json={"amount": 100})
 
         self.assertEqual(calls, 3)
         self.assertEqual(caught.exception.attempts, 3)
@@ -240,12 +239,14 @@ class HttpClientTests(unittest.TestCase):
             max_attempts=2,
             backoff=BackoffConfig(initial_delay=0, max_delay=0),
         )
-        with HttpClient(
-            config_with(rule),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(NonReplayableRequestError) as caught:
-                client.put("/objects/1", content=body())
+        with (
+            HttpClient(
+                config_with(rule),
+                transport=httpx.MockTransport(handler),
+            ) as client,
+            self.assertRaises(NonReplayableRequestError) as caught,
+        ):
+            client.put("/objects/1", content=body())
 
         self.assertEqual(calls, 0)
         self.assertEqual(caught.exception.attempts, 0)
@@ -264,12 +265,14 @@ class HttpClientTests(unittest.TestCase):
             max_attempts=2,
             backoff=BackoffConfig(initial_delay=0, max_delay=0),
         )
-        with HttpClient(
-            config_with(rule),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(SystemHttpError):
-                client.put("/objects/1", content=b"important-data")
+        with (
+            HttpClient(
+                config_with(rule),
+                transport=httpx.MockTransport(handler),
+            ) as client,
+            self.assertRaises(SystemHttpError),
+        ):
+            client.put("/objects/1", content=b"important-data")
 
         self.assertEqual(bodies, [b"important-data", b"important-data"])
 
@@ -287,12 +290,14 @@ class HttpClientTests(unittest.TestCase):
             max_attempts=3,
             backoff=BackoffConfig(initial_delay=0, max_delay=0),
         )
-        with HttpClient(
-            config_with(rule),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(SystemHttpError) as caught:
-                client.get("/slow")
+        with (
+            HttpClient(
+                config_with(rule),
+                transport=httpx.MockTransport(handler),
+            ) as client,
+            self.assertRaises(SystemHttpError) as caught,
+        ):
+            client.get("/slow")
 
         self.assertEqual(calls, 3)
         self.assertEqual(caught.exception.attempts, 3)
@@ -309,15 +314,17 @@ class HttpClientTests(unittest.TestCase):
         )
         transport = httpx.MockTransport(lambda request: httpx.Response(503))
 
-        with HttpClient(config_with(rule), transport=transport) as client:
-            with self.assertRaises(UpstreamUnavailable) as caught:
-                client.get("/inventory")
+        with (
+            HttpClient(config_with(rule), transport=transport) as client,
+            self.assertRaises(UpstreamUnavailable) as caught,
+        ):
+            client.get("/inventory")
 
         self.assertEqual(caught.exception.attempts, 2)
         self.assertIsInstance(caught.exception, SystemHttpError)
 
     def test_retry_after_header_overrides_exponential_delay(self) -> None:
-        sleeps: List[float] = []
+        sleeps: list[float] = []
         rule = RetryRule(
             name="rate-limit",
             status_codes=frozenset({429}),
@@ -329,22 +336,22 @@ class HttpClientTests(unittest.TestCase):
                 respect_retry_after=True,
             ),
         )
-        transport = httpx.MockTransport(
-            lambda request: httpx.Response(429, headers={"Retry-After": "7"})
-        )
-        with HttpClient(
-            config_with(rule),
-            transport=transport,
-            sleep=sleeps.append,
-            random_value=lambda: 0.0,
-        ) as client:
-            with self.assertRaises(SystemHttpError):
-                client.get("/")
+        transport = httpx.MockTransport(lambda request: httpx.Response(429, headers={"Retry-After": "7"}))
+        with (
+            HttpClient(
+                config_with(rule),
+                transport=transport,
+                sleep=sleeps.append,
+                random_value=lambda: 0.0,
+            ) as client,
+            self.assertRaises(SystemHttpError),
+        ):
+            client.get("/")
 
         self.assertEqual(sleeps, [7.0])
 
     def test_retry_after_never_shortens_exponential_delay(self) -> None:
-        sleeps: List[float] = []
+        sleeps: list[float] = []
         rule = RetryRule(
             name="rate-limit",
             status_codes=frozenset({429}),
@@ -356,22 +363,22 @@ class HttpClientTests(unittest.TestCase):
                 respect_retry_after=True,
             ),
         )
-        transport = httpx.MockTransport(
-            lambda request: httpx.Response(429, headers={"Retry-After": "1"})
-        )
-        with HttpClient(
-            config_with(rule),
-            transport=transport,
-            sleep=sleeps.append,
-            random_value=lambda: 0.0,
-        ) as client:
-            with self.assertRaises(SystemHttpError):
-                client.get("/")
+        transport = httpx.MockTransport(lambda request: httpx.Response(429, headers={"Retry-After": "1"}))
+        with (
+            HttpClient(
+                config_with(rule),
+                transport=transport,
+                sleep=sleeps.append,
+                random_value=lambda: 0.0,
+            ) as client,
+            self.assertRaises(SystemHttpError),
+        ):
+            client.get("/")
 
         self.assertEqual(sleeps, [5.0])
 
     def test_retry_after_http_date_is_supported(self) -> None:
-        sleeps: List[float] = []
+        sleeps: list[float] = []
         rule = RetryRule(
             name="rate-limit-date",
             status_codes=frozenset({429}),
@@ -388,22 +395,24 @@ class HttpClientTests(unittest.TestCase):
                 headers={"Retry-After": "Sat, 25 Jul 2026 00:00:10 GMT"},
             )
         )
-        with HttpClient(
-            config_with(rule),
-            transport=transport,
-            sleep=sleeps.append,
-            random_value=lambda: 0.0,
-            now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
-        ) as client:
-            with self.assertRaises(SystemHttpError):
-                client.get("/")
+        with (
+            HttpClient(
+                config_with(rule),
+                transport=transport,
+                sleep=sleeps.append,
+                random_value=lambda: 0.0,
+                now=lambda: datetime(2026, 7, 25, tzinfo=timezone.utc),
+            ) as client,
+            self.assertRaises(SystemHttpError),
+        ):
+            client.get("/")
 
         self.assertEqual(sleeps, [10.0])
 
     def test_extremely_large_retry_after_is_capped_without_leaking_overflow(
         self,
     ) -> None:
-        sleeps: List[float] = []
+        sleeps: list[float] = []
         huge_value = "9" * 5000
         rule = RetryRule(
             name="huge-retry-after",
@@ -418,13 +427,15 @@ class HttpClientTests(unittest.TestCase):
             )
         )
 
-        with HttpClient(
-            config_with(rule),
-            transport=transport,
-            sleep=sleeps.append,
-        ) as client:
-            with self.assertRaises(SystemHttpError):
-                client.get("/")
+        with (
+            HttpClient(
+                config_with(rule),
+                transport=transport,
+                sleep=sleeps.append,
+            ) as client,
+            self.assertRaises(SystemHttpError),
+        ):
+            client.get("/")
 
         self.assertEqual(sleeps, [8.0])
 
@@ -458,12 +469,14 @@ class HttpClientTests(unittest.TestCase):
             base_url="https://example.test",
             retry_policy=policy,
         )
-        with HttpClient(
-            config,
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(BusinessHttpError) as caught:
-                client.get("/")
+        with (
+            HttpClient(
+                config,
+                transport=httpx.MockTransport(handler),
+            ) as client,
+            self.assertRaises(BusinessHttpError) as caught,
+        ):
+            client.get("/")
 
         self.assertEqual(calls, 2)
         self.assertEqual(caught.exception.attempts, 2)
@@ -473,9 +486,11 @@ class HttpClientTests(unittest.TestCase):
         transport = httpx.MockTransport(lambda request: httpx.Response(403))
         config = HttpClientConfig(base_url="https://user:pass@example.test")
 
-        with HttpClient(config, transport=transport) as client:
-            with self.assertRaises(BusinessHttpError) as caught:
-                client.get("/private?token=secret")
+        with (
+            HttpClient(config, transport=transport) as client,
+            self.assertRaises(BusinessHttpError) as caught,
+        ):
+            client.get("/private?token=secret")
 
         self.assertEqual(caught.exception.url, "https://example.test/private")
         self.assertNotIn("secret", str(caught.exception))
@@ -485,18 +500,22 @@ class HttpClientTests(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             raise RuntimeError("programming bug")
 
-        with HttpClient(
-            config_with(),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaisesRegex(RuntimeError, "programming bug"):
-                client.get("/")
+        with (
+            HttpClient(
+                config_with(),
+                transport=httpx.MockTransport(handler),
+            ) as client,
+            self.assertRaisesRegex(RuntimeError, "programming bug"),
+        ):
+            client.get("/")
 
     def test_invalid_url_is_wrapped_as_system_error(self) -> None:
         config = HttpClientConfig()
-        with HttpClient(config) as client:
-            with self.assertRaises(SystemHttpError) as caught:
-                client.get("https://example.test:invalid/")
+        with (
+            HttpClient(config) as client,
+            self.assertRaises(SystemHttpError) as caught,
+        ):
+            client.get("https://example.test:invalid/")
 
         self.assertEqual(caught.exception.attempts, 1)
         self.assertEqual(caught.exception.url, "<invalid-url>")
@@ -546,9 +565,7 @@ class HttpClientTests(unittest.TestCase):
     def test_context_manager_closes_underlying_client(self) -> None:
         with HttpClient(
             config_with(),
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(200)
-            ),
+            transport=httpx.MockTransport(lambda request: httpx.Response(200)),
         ) as client:
             self.assertFalse(client.raw_client.is_closed)
         self.assertTrue(client.raw_client.is_closed)
@@ -557,7 +574,7 @@ class HttpClientTests(unittest.TestCase):
 class AsyncHttpClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_client_retries_and_then_succeeds(self) -> None:
         calls = 0
-        sleeps: List[float] = []
+        sleeps: list[float] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal calls
@@ -593,9 +610,7 @@ class AsyncHttpClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_final_business_error_uses_same_contract(self) -> None:
         async with AsyncHttpClient(
             config_with(),
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(403)
-            ),
+            transport=httpx.MockTransport(lambda request: httpx.Response(403)),
         ) as client:
             with self.assertRaises(BusinessHttpError) as caught:
                 await client.get("/admin?token=secret")

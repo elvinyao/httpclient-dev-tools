@@ -12,8 +12,48 @@ dependencies = [
     "httpx>=0.25,<1",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.8,<1",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 resilient_http = ["py.typed"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 200
+src = ["src", "tests"]
+extend-exclude = [
+    ".venv",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = [
+    "B",
+    "C4",
+    "E",
+    "F",
+    "I",
+    "PIE",
+    "RUF",
+    "SIM",
+    "UP",
+    "W",
+]
+fixable = ["ALL"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["resilient_http"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+skip-magic-trailing-comma = false
+docstring-code-format = true
