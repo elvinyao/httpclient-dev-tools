@@ -116,17 +116,16 @@ dependencies = [
     { name = "httpx" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 dev = [
     { name = "ruff" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "httpx", specifier = ">=0.25,<1" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8,<1" },
-]
-provides-extras = ["dev"]
+requires-dist = [{ name = "httpx", specifier = ">=0.25,<1" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "ruff", specifier = ">=0.8,<1" }]
 
 [[package]]
 name = "ruff"

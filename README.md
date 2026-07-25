@@ -11,8 +11,11 @@
 ## 安装
 
 ```bash
-pip install -e .
+uv sync
 ```
+
+`uv sync` 会根据已提交的 `uv.lock` 创建或更新 `.venv`，并默认安装
+`dependency-groups.dev` 中的开发工具。
 
 ## 最简配置
 
@@ -236,15 +239,15 @@ async with AsyncHttpClient(config) as client:
 ## 运行测试
 
 ```bash
-python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
 ```
 
 ## 代码质量
 
 ```bash
-pip install -e ".[dev]"
-ruff format .
-ruff check .
+uv run ruff format .
+uv run ruff check .
 ```
 
-Ruff 配置统一维护在 `pyproject.toml`。
+依赖统一通过 `uv add`/`uv remove` 管理，Ruff 配置统一维护在
+`pyproject.toml`。修改依赖后提交更新后的 `uv.lock`。
