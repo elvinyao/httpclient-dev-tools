@@ -2,9 +2,10 @@
 
 from urllib3.util import Retry
 
-from .client import create_session
+from .client import create_retry, create_session
 
 __all__ = [
     "Retry",
+    "create_retry",
     "create_session",
 ]

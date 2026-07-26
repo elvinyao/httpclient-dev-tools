@@ -27,7 +27,7 @@ from urllib3.exceptions import SSLError as Urllib3SSLError
 from urllib3.util import Retry
 
 import resilient_http
-from resilient_http import create_session
+from resilient_http import create_retry, create_session
 
 # 中文测试说明使用中文全角标点，以保持注释的自然可读性。
 # ruff: noqa: RUF002, RUF003
@@ -57,6 +57,25 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         return None
+
+
+class TimeoutRecordingAdapter(HTTPAdapter):
+    """记录 Session 交给 Adapter 的 timeout，不进行真实网络访问。"""
+
+    def __init__(self) -> None:
+        super().__init__(max_retries=0)
+        self.timeouts: list[Any] = []
+
+    def send(self, request: requests.PreparedRequest, **kwargs: Any) -> requests.Response:
+        """保存本次有效 timeout，并返回足以走完 Requests send 流程的成功响应。"""
+
+        self.timeouts.append(kwargs.get("timeout"))
+        response = requests.Response()
+        response.status_code = 200
+        response.url = request.url
+        response.request = request
+        response._content = b"ok"
+        return response
 
 
 class ScriptedServer:
@@ -229,6 +248,41 @@ def create_test_session(retry: Retry) -> requests.Session:
     return session
 
 
+def mount_timeout_recorder(session: requests.Session) -> TimeoutRecordingAdapter:
+    """挂载仅记录有效 timeout 的 Adapter，隔离 timeout 测试与真实网络时序。"""
+
+    adapter = TimeoutRecordingAdapter()
+    session.mount("http://", adapter)
+    return adapter
+
+
+def prepare_get() -> requests.PreparedRequest:
+    """建立供 Session.send 直接调用的 GET PreparedRequest。"""
+
+    return requests.Request("GET", "http://timeout.test/resource").prepare()
+
+
+_TIMEOUT_OMITTED = object()
+
+
+def issue_timeout_probe(
+    session: requests.Session,
+    style: str,
+    *,
+    timeout: Any = _TIMEOUT_OMITTED,
+) -> requests.Response:
+    """通过 GET、POST 或直接 send 发请求，按需保留 timeout 的“省略”状态。"""
+
+    kwargs = {} if timeout is _TIMEOUT_OMITTED else {"timeout": timeout}
+    if style == "get":
+        return session.get("http://timeout.test/resource", **kwargs)
+    if style == "post":
+        return session.post("http://timeout.test/resource", data=b"payload", **kwargs)
+    if style == "send":
+        return session.send(prepare_get(), **kwargs)
+    raise ValueError(f"unknown timeout probe style: {style}")
+
+
 def request_methods(server: ScriptedServer) -> list[str]:
     """提取 server 实际收到的方法，便于清晰断言 retry 次数。"""
 
@@ -255,11 +309,12 @@ def contains_exception(error: BaseException, expected_type: type[BaseException])
     return False
 
 
-def test_only_retry_and_create_session_are_public() -> None:
-    """场景：使用者从包根入口导入；预期：仅暴露原生 Retry 与 factory，旧 API 不再可见。"""
+def test_only_retry_and_factories_are_public() -> None:
+    """场景：使用者从包根入口导入；预期：仅暴露原生 Retry、两个 factory，旧 API 不再可见。"""
 
-    assert resilient_http.__all__ == ["Retry", "create_session"]
+    assert resilient_http.__all__ == ["Retry", "create_retry", "create_session"]
     assert resilient_http.Retry is Retry
+    assert resilient_http.create_retry is create_retry
     assert resilient_http.create_session is create_session
 
     old_symbols = (
@@ -280,12 +335,248 @@ def test_only_retry_and_create_session_are_public() -> None:
     assert all(not hasattr(resilient_http, name) for name in old_symbols)
 
 
+def test_create_retry_builds_documented_default_policy() -> None:
+    """场景：APP 不覆盖任何 retry 参数；预期：得到已确认的安全默认策略和固定 redirect/Retry-After 行为。"""
+
+    retry = create_retry()
+
+    assert type(retry) is Retry
+    assert retry.total == 3
+    assert retry.connect is None
+    assert retry.read is None
+    assert retry.status is None
+    assert retry.other == 0
+    assert retry.redirect == 0
+    assert retry.allowed_methods == frozenset({"GET", "HEAD", "OPTIONS"})
+    assert retry.status_forcelist == frozenset({429, 500, 502, 503, 504})
+    assert retry.backoff_factor == 0.5
+    assert retry.raise_on_status is False
+    assert retry.respect_retry_after_header is True
+    assert retry.history == ()
+
+
+def test_create_retry_accepts_every_supported_policy_override() -> None:
+    """场景：APP 覆盖所有开放策略参数；预期：值原样交给 urllib3，同时固定的 redirect 与 Retry-After 不变。"""
+
+    retry = create_retry(
+        total=7,
+        connect=1,
+        read=2,
+        status=3,
+        other=4,
+        allowed_methods=frozenset({"POST"}),
+        status_forcelist=frozenset({418}),
+        backoff_factor=1.25,
+        raise_on_status=True,
+    )
+
+    assert type(retry) is Retry
+    assert retry.total == 7
+    assert retry.connect == 1
+    assert retry.read == 2
+    assert retry.status == 3
+    assert retry.other == 4
+    assert retry.redirect == 0
+    assert retry.allowed_methods == frozenset({"POST"})
+    assert retry.status_forcelist == frozenset({418})
+    assert retry.backoff_factor == 1.25
+    assert retry.raise_on_status is True
+    assert retry.respect_retry_after_header is True
+
+
+def test_each_create_retry_call_returns_independent_native_retry() -> None:
+    """场景：连续调用默认 factory；预期：每次返回独立的原生 Retry，且任何请求 history 均不被共享。"""
+
+    first = create_retry()
+    second = create_retry()
+
+    assert type(first) is Retry
+    assert type(second) is Retry
+    assert first is not second
+    assert first.history == ()
+    assert second.history == ()
+
+    incremented = first.increment(
+        method="GET",
+        url="/resource",
+        error=ReadTimeoutError(None, "/resource", "synthetic read timeout"),
+    )
+    assert incremented is not first
+    assert len(incremented.history) == 1
+    assert first.history == ()
+    assert second.history == ()
+
+
+def test_create_retry_default_policy_retries_get_status(server_factory: ServerFactory) -> None:
+    """场景：默认策略的 GET 先返回 503 再返回 200；预期：503 在默认 forcelist 内，因此透明重试成功。"""
+
+    server = server_factory([503, 200])
+
+    with create_test_session(create_retry()) as session:
+        response = session.get(server.url, timeout=1)
+
+    assert response.status_code == 200
+    assert request_methods(server) == ["GET", "GET"]
+
+
+def test_create_retry_default_policy_does_not_retry_post_status(server_factory: ServerFactory) -> None:
+    """场景：默认策略的 POST 返回 503；预期：POST 不在默认 allowed_methods，避免重复业务副作用。"""
+
+    server = server_factory([503, 200])
+
+    with create_test_session(create_retry()) as session:
+        response = session.post(server.url, data=b"payload", timeout=1)
+
+    assert response.status_code == 503
+    assert server.requests == [("POST", "/resource", b"payload")]
+
+
 @pytest.mark.parametrize("invalid_retry", [None, 0, object()], ids=["none", "integer", "plain-object"])
 def test_create_session_rejects_non_retry_values(invalid_retry: object) -> None:
     """场景：调用方传入非 urllib3 Retry；预期：factory 立即报 TypeError，不创建半配置 Session。"""
 
     with pytest.raises(TypeError, match=r"urllib3\.util\.Retry"):
         create_session(invalid_retry)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("style", ["get", "post", "send"], ids=["get", "post", "direct-send"])
+def test_configured_default_timeout_applies_to_all_session_entry_points(style: str) -> None:
+    """场景：Session 配置默认 timeout 后通过 GET、POST 或直接 send；预期：省略单次值时均传递 factory 默认值。"""
+
+    default_timeout = (0.25, 0.75)
+    with create_session(Retry(total=0), timeout=default_timeout) as session:
+        session.trust_env = False
+        recorder = mount_timeout_recorder(session)
+        response = issue_timeout_probe(session, style)
+
+    assert isinstance(session, requests.Session)
+    assert response.status_code == 200
+    assert recorder.timeouts == [default_timeout]
+
+
+@pytest.mark.parametrize("style", ["get", "post", "send"], ids=["get", "post", "direct-send"])
+def test_per_request_timeout_overrides_configured_default(style: str) -> None:
+    """场景：Session 有默认 timeout，但本次 GET、POST 或 send 提供新值；预期：只对此请求采用显式覆盖值。"""
+
+    with create_session(Retry(total=0), timeout=(1, 2)) as session:
+        session.trust_env = False
+        recorder = mount_timeout_recorder(session)
+        response = issue_timeout_probe(session, style, timeout=0.125)
+
+    assert response.status_code == 200
+    assert recorder.timeouts == [0.125]
+
+
+@pytest.mark.parametrize("style", ["get", "post", "send"], ids=["get", "post", "direct-send"])
+def test_explicit_none_disables_configured_timeout_for_one_request(style: str) -> None:
+    """场景：Session 有默认 timeout，但单次请求显式传 None；预期：保留 None，不能被 factory 默认值覆盖。"""
+
+    with create_session(Retry(total=0), timeout=(1, 2)) as session:
+        session.trust_env = False
+        recorder = mount_timeout_recorder(session)
+        response = issue_timeout_probe(session, style, timeout=None)
+
+    assert response.status_code == 200
+    assert recorder.timeouts == [None]
+
+
+def test_timeout_session_request_preserves_positional_params_argument() -> None:
+    """场景：按 Requests 原生签名把 params 作为第三个位置参数；预期：query 正常编码且仍采用默认 timeout。"""
+
+    with create_session(Retry(total=0), timeout=(1, 2)) as session:
+        session.trust_env = False
+        recorder = mount_timeout_recorder(session)
+        response = session.request(
+            "GET",
+            "http://timeout.test/resource",
+            {"page": "2"},
+        )
+
+    assert response.status_code == 200
+    assert response.request.url == "http://timeout.test/resource?page=2"
+    assert recorder.timeouts == [(1, 2)]
+
+
+def test_positional_timeout_none_disables_default_timeout() -> None:
+    """场景：按 Requests 原生签名把第九个 timeout 位置参数显式设为 None；预期：不回填 Session 默认值。"""
+
+    with create_session(Retry(total=0), timeout=(1, 2)) as session:
+        session.trust_env = False
+        recorder = mount_timeout_recorder(session)
+        response = session.request(
+            "GET",
+            "http://timeout.test/resource",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+    assert response.status_code == 200
+    assert recorder.timeouts == [None]
+
+
+def test_effective_default_timeout_is_preserved_across_redirect_hops(
+    monkeypatch: pytest.MonkeyPatch,
+    server_factory: ServerFactory,
+) -> None:
+    """场景：使用默认 timeout 的 GET 经历一次 302；预期：初始请求和 redirect 后请求都收到同一个有效值。"""
+
+    redirect = ResponseSpec(status=302, headers=(("Location", "/redirected"),))
+    server = server_factory([redirect, ResponseSpec(status=200, body=b"ok")])
+    default_timeout = (0.2, 0.5)
+    observed_timeouts: list[Any] = []
+
+    with create_session(Retry(total=0), timeout=default_timeout) as session:
+        session.trust_env = False
+        adapter = session.get_adapter(server.url)
+        real_send = adapter.send
+
+        def record_timeout(request: requests.PreparedRequest, **kwargs: Any) -> requests.Response:
+            observed_timeouts.append(kwargs.get("timeout"))
+            return real_send(request, **kwargs)
+
+        monkeypatch.setattr(adapter, "send", record_timeout)
+        response = session.get(server.url)
+
+    assert response.status_code == 200
+    assert response.content == b"ok"
+    assert observed_timeouts == [default_timeout, default_timeout]
+    assert [(method, path) for method, path, _ in server.requests] == [
+        ("GET", "/resource"),
+        ("GET", "/redirected"),
+    ]
+
+
+@pytest.mark.parametrize("explicit_none", [False, True], ids=["omitted", "explicit-none"])
+def test_create_session_without_default_timeout_returns_native_session(explicit_none: bool) -> None:
+    """场景：factory 省略 timeout 或显式传 None；预期：返回普通 requests.Session，不引入私有 timeout 行为。"""
+
+    retry = Retry(total=0)
+    session = create_session(retry, timeout=None) if explicit_none else create_session(retry)
+
+    try:
+        assert type(session) is requests.Session
+        assert session.get_adapter("http://example.test").max_retries is retry
+        assert session.get_adapter("https://example.test").max_retries is retry
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("style", ["get", "post", "send"], ids=["get", "post", "direct-send"])
+def test_native_session_without_default_timeout_preserves_requests_none(style: str) -> None:
+    """场景：未配置 factory timeout 并省略单次值；预期：GET、POST 与 send 都保持 Requests 原生 None。"""
+
+    with create_session(Retry(total=0)) as session:
+        session.trust_env = False
+        recorder = mount_timeout_recorder(session)
+        response = issue_timeout_probe(session, style)
+
+    assert response.status_code == 200
+    assert recorder.timeouts == [None]
 
 
 def test_each_create_session_has_independent_adapters_and_pools() -> None:

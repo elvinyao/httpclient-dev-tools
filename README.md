@@ -1,18 +1,19 @@
-# Resilient HTTP Client 0.2.0
+# Resilient HTTP Client 0.3.0
 
 一个基于 Requests 和 urllib3 的最小同步 HTTP Session factory。
 
-本项目只做一件事：接收调用方明确创建的 `urllib3.util.Retry`，返回一个已为
-`http://` 和 `https://` 挂载 Retry Adapter 的独立 `requests.Session`。
+本项目提供一个有明确默认值的 Retry factory，以及一个为 `http://` 和
+`https://` 挂载 Retry Adapter 的独立 Session factory。
 
-公开 API 只有：
+公开 API 只有三个：
 
 ```python
-from resilient_http import Retry, create_session
+from resilient_http import Retry, create_retry, create_session
 ```
 
-没有自定义 HTTP Client、配置模型、业务异常、attempt 统计、base URL、默认
-timeout、redirect 策略或流量控制。
+没有自定义 HTTP Client、配置模型、业务异常、attempt 统计、base URL、
+redirect 限制或流量控制。可选的 Session 默认 timeout 只负责补充 Requests 调用
+参数，不实现总 deadline。
 
 ## 安装和开发
 
@@ -72,59 +73,114 @@ uv run pytest
 
 pytest 配置会严格检查未知配置项和未注册 marker，避免拼写错误被静默忽略。
 
-## 完整示例
+## 简化示例
 
-`retry` 是 `create_session` 的必填参数。本项目不提供隐藏的默认重试策略：
+`retry` 仍是 `create_session` 的必填参数；使用 `create_retry()` 即可获得项目推荐
+的默认策略：
 
 ```python
 import requests
 
-from resilient_http import Retry, create_session
+from resilient_http import create_retry, create_session
 
-
-retry = Retry(
-    # 首次请求之后最多再重试 3 次。
-    total=3,
-    connect=3,
-    read=1,
-    status=2,
-    other=0,
-    allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
-    status_forcelist=frozenset({429, 500, 502, 503, 504}),
-    backoff_factor=0.5,
-    backoff_max=30.0,
-    backoff_jitter=0.5,
-    respect_retry_after_header=True,
-    # 耗尽状态重试后返回最后一个 Response，由 APP 统一处理。
-    raise_on_status=False,
-)
 
 try:
-    with create_session(retry) as session:
-        response = session.get(
-            "https://api.example.com/v1/users/123",
-            # Requests 没有默认 timeout；每个调用都应明确传入。
-            timeout=(3, 20),
-        )
+    retry = create_retry()
+    with create_session(retry, timeout=(3, 20)) as session:
+        response = session.get("https://api.example.com/v1/users/123")
         response.raise_for_status()
         user = response.json()
 except requests.RequestException as error:
     print(f"HTTP request failed: {error}")
 ```
 
-`create_session` 的签名为：
+`create_retry()` 的完整默认参数是：
 
 ```python
-def create_session(retry: Retry) -> requests.Session: ...
+retry = create_retry(
+    total=3,
+    connect=None,
+    read=None,
+    status=None,
+    other=0,
+    allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
+    status_forcelist=frozenset({429, 500, 502, 503, 504}),
+    backoff_factor=0.5,
+    raise_on_status=False,
+)
 ```
 
-它不会修改传入的 Retry，也不会替业务 APP 决定哪些方法、状态码或错误应该重试。
-Adapter 保存的是重试策略；urllib3 在每个逻辑请求中创建独立的 Retry/history
-状态，因此同一 Session 内先前请求的 attempts 不会消耗后续请求的重试次数。
+`create_retry()` 还固定使用 `redirect=0` 和
+`respect_retry_after_header=True`。`connect`、`read`、`status` 为 `None`
+表示不设置单独的分类上限，仍共同受 `total=3` 的总重试上限约束；`other=0`
+避免对未明确分类的错误进行意外重试。
+
+两个 factory 的主要签名为：
+
+```python
+def create_retry(
+    *,
+    total=3,
+    connect=None,
+    read=None,
+    status=None,
+    other=0,
+    allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
+    status_forcelist=frozenset({429, 500, 502, 503, 504}),
+    backoff_factor=0.5,
+    raise_on_status=False,
+): ...
+
+
+def create_session(
+    retry,
+    *,
+    timeout=None,
+): ...
+```
+
+`create_session` 不会修改传入的 Retry。Adapter 保存的是重试策略；urllib3
+在每个逻辑请求中创建独立的 Retry/history 状态，因此同一 Session 内先前请求的
+attempts 不会消耗后续请求的重试次数。
 
 ## Retry 语义
 
-重试行为完全采用 urllib3：
+常见调整直接传给 `create_retry()`：
+
+```python
+retry = create_retry(
+    total=5,
+    read=2,
+    status=3,
+    backoff_factor=1.0,
+)
+```
+
+需要 `backoff_max`、jitter 或 urllib3 的其他高级参数时，直接创建并传入原生
+`Retry`：
+
+```python
+from resilient_http import Retry
+
+
+retry = Retry(
+    total=5,
+    connect=5,
+    read=2,
+    redirect=0,
+    status=3,
+    other=0,
+    allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
+    status_forcelist=frozenset({429, 500, 502, 503, 504}),
+    backoff_factor=1.0,
+    backoff_max=30.0,
+    backoff_jitter=0.25,
+    respect_retry_after_header=True,
+    raise_on_status=False,
+)
+```
+
+无论使用哪种创建方式，重试行为都采用 urllib3：
 
 - `total` 是首次发送之后的总重试上限。`total=3` 表示最多发送 4 次。
 - `connect`、`read`、`status` 和 `other` 是分类上限，同时受 `total` 约束。
@@ -187,18 +243,42 @@ Requests 的 Session/Adapter API，而不是继续给这个最小 factory 增加
 
 ## Timeout
 
-Requests 默认没有 timeout，本项目也不添加默认值。每一次调用都应明确传入：
+Requests 原生默认没有 timeout。`create_session` 可以选择为该 Session 配置一个
+默认值：
 
 ```python
-response = session.get(
-    "https://api.example.com/health",
-    timeout=(3, 20),
-)
+with create_session(create_retry(), timeout=(3, 20)) as session:
+    # 请求没有传 timeout，使用 Session 默认值 (3, 20)。
+    response = session.get("https://api.example.com/health")
+
+    # 单次请求显式覆盖 Session 默认值。
+    fast_response = session.get(
+        "https://api.example.com/fast",
+        timeout=(1, 5),
+    )
+
+    # 单次请求显式关闭 timeout，恢复 Requests 的无限等待行为。
+    unbounded_response = session.get(
+        "https://api.example.com/long-running",
+        timeout=None,
+    )
 ```
 
-tuple 分别表示 connect timeout 和 read timeout。它们作用于每一次物理尝试，
-不是覆盖全部 retry、backoff、DNS 和响应读取过程的端到端 deadline。因此总耗时
-可能明显大于单次 timeout。
+调用 `create_session(retry)` 或 `create_session(retry, timeout=None)` 时不配置
+Session 默认值，行为与普通 Requests 一致；此时应在每次请求中传入所需的
+`timeout=`。
+
+factory 配置了 timeout 时，规则如下：
+
+- 请求省略 `timeout`：使用 Session 默认值。
+- 请求显式传入其他值：只覆盖本次请求。
+- 请求显式传入 `timeout=None`：只关闭本次请求的默认 timeout。
+- 直接调用 `session.send(prepared_request, ...)` 时也遵循相同规则。
+
+数字 timeout 同时用于 connect 和 read；tuple 的两个值分别表示 connect timeout
+和 read timeout。timeout 会应用到每一次物理 retry attempt，而不是覆盖所有
+attempt、backoff、DNS 和响应读取过程的端到端 deadline。read timeout 也不是下载
+完整响应体的总时限。因此一次逻辑请求的总耗时可能明显大于配置值。
 
 ## stream=True
 
@@ -275,7 +355,7 @@ async API，也不应直接在 asyncio event loop 中执行；异步 APP 应使�
 
 ## 配置 Session 原生能力
 
-`create_session` 返回普通 `requests.Session`，可以直接使用 Requests API：
+`create_session` 返回 `requests.Session`，可以直接使用 Requests API：
 
 ```python
 with create_session(retry) as session:
@@ -294,9 +374,10 @@ with create_session(retry) as session:
 
 Cookie、proxy、client certificate、hooks 和其他行为同样直接遵循 Requests。
 
-## 从 0.1.x 迁移
+## 从旧版本迁移
 
-0.2.0 是一次有意的 breaking simplification。旧 API 不再提供兼容别名。
+0.2.0 完成了 breaking simplification；0.3.0 保持该最小边界，同时新增
+`create_retry()` 和可选的 Session 默认 timeout。旧 API 仍不提供兼容别名。
 
 删除的公开入口包括：
 
@@ -321,26 +402,20 @@ Cookie、proxy、client certificate、hooks 和其他行为同样直接遵循 Re
 with HttpClient(config) as client:
     response = client.get("/users/123")
 
-# 0.2.0
-retry = Retry(
-    total=3,
-    allowed_methods={"GET", "HEAD", "OPTIONS"},
-    status_forcelist={429, 500, 502, 503, 504},
-    raise_on_status=False,
-)
+# 0.3.0
+retry = create_retry()
 
-with create_session(retry) as session:
-    response = session.get(
-        "https://api.example.com/v1/users/123",
-        timeout=(3, 20),
-    )
+with create_session(retry, timeout=(3, 20)) as session:
+    response = session.get("https://api.example.com/v1/users/123")
     response.raise_for_status()
 ```
 
 迁移时需要显式处理：
 
 - 原来的 `base_url` 不再拼接；传入完整绝对 URL。
-- 原来的默认 timeout 不再存在；每个请求传 `timeout=`。
+- 0.2.x 的 timeout 行为仍兼容：`create_session(retry)` 不配置默认值，每次请求按需
+  传 `timeout=`；0.3.0 也可通过 `create_session(retry, timeout=...)` 统一配置，
+  单次请求仍可覆盖或显式传 `None` 关闭。
 - 原来的 headers、TLS、环境、Cookie 和 redirect 配置改为设置 Session 原生属性。
 - 原来的 PoolConfig 被删除；factory 使用 HTTPAdapter 原生池配置。
 - 原来的 Business/System 异常改为 Requests 原生异常和
