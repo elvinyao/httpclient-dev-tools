@@ -1,911 +1,862 @@
 from __future__ import annotations
 
+import io
+import socket
+import threading
 import unittest
-from typing import get_type_hints
-from unittest.mock import patch
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, get_type_hints
 
-import httpx
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 import resilient_http
 from resilient_http import (
-    AsyncHttpClient,
-    BaseHttpError,
     BusinessHttpError,
     ErrorMappingPolicy,
     ErrorMappingRule,
     HttpClient,
     HttpClientConfig,
     NonReplayableRequestError,
-    Retry,
+    PoolConfig,
+    RetryConfig,
     SystemHttpError,
+    TimeoutConfig,
+    create_session,
+    retry_from_dict,
 )
-from resilient_http._vendor.httpx_retries import RetryTransport
 
 
-class UpstreamUnavailable(SystemHttpError):
+class InventoryUnavailable(SystemHttpError):
     pass
 
 
-def retry_for(
-    *,
+class PermissionDenied(BusinessHttpError):
+    pass
+
+
+ResponseSpec = tuple[int, dict[str, str], bytes]
+
+
+class ScriptedServer:
+    def __init__(self, responses: list[ResponseSpec]) -> None:
+        self.responses = responses
+        self.requests: list[tuple[str, str, bytes, dict[str, str]]] = []
+        self._index = 0
+        self._lock = threading.Lock()
+        self._server: ThreadingHTTPServer
+        self._thread: threading.Thread
+
+    def __enter__(self) -> ScriptedServer:
+        scripted = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _respond(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length else b""
+                with scripted._lock:
+                    scripted.requests.append(
+                        (
+                            self.command,
+                            self.path,
+                            body,
+                            dict(self.headers.items()),
+                        )
+                    )
+                    index = min(scripted._index, len(scripted.responses) - 1)
+                    status, headers, payload = scripted.responses[index]
+                    scripted._index += 1
+
+                self.send_response(status)
+                normalized_headers = {key.lower() for key in headers}
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                if "content-length" not in normalized_headers:
+                    self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if payload:
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                if headers.get("Connection", "").lower() == "close":
+                    self.close_connection = True
+
+            do_GET = _respond
+            do_POST = _respond
+            do_PUT = _respond
+            do_PATCH = _respond
+            do_DELETE = _respond
+            do_HEAD = _respond
+
+            def log_message(self, *args: Any) -> None:
+                return None
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._server.server_address
+        return f"http://{host}:{port}"
+
+    def __exit__(self, *args: Any) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+class RecordingSession(requests.Session):
+    def __init__(self, statuses: tuple[int, ...] = (200,)) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.statuses = iter(statuses)
+        self.was_closed = False
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        self.calls.append((method, url, kwargs))
+        response = requests.Response()
+        response.status_code = next(self.statuses)
+        response.url = url
+        response.request = requests.Request(method, url).prepare()
+        response._content = b"ok"
+        return response
+
+    def close(self) -> None:
+        self.was_closed = True
+        super().close()
+
+
+def retry_config(
     total: int,
-    allowed_methods: tuple[str, ...] = ("GET",),
-    status_forcelist: tuple[int, ...] = (503,),
-    retry_on_exceptions: tuple[type[Exception], ...] = (httpx.ConnectTimeout,),
-) -> Retry:
-    return Retry(
+    *,
+    allowed_methods: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"}),
+    status_forcelist: frozenset[int] = frozenset({429, 500, 502, 503, 504}),
+    connect: int | None = None,
+    read: int | None = None,
+    status: int | None = None,
+) -> RetryConfig:
+    return RetryConfig(
         total=total,
+        connect=connect,
+        read=read,
+        status=status,
+        other=0,
         allowed_methods=allowed_methods,
         status_forcelist=status_forcelist,
-        retry_on_exceptions=retry_on_exceptions,
         backoff_factor=0,
+        backoff_max=1,
         backoff_jitter=0,
+        retry_after_max=1,
     )
 
 
-def client_config(
-    *,
-    retry: Retry | None = None,
-    enable_error_mapping: bool = True,
-    error_mapping: ErrorMappingPolicy | None = None,
-) -> HttpClientConfig:
-    return HttpClientConfig(
-        base_url="https://example.test",
-        retry=retry if retry is not None else Retry(total=0),
-        enable_error_mapping=enable_error_mapping,
-        error_mapping=error_mapping if error_mapping is not None else ErrorMappingPolicy(),
-    )
+class ConfigurationTests(unittest.TestCase):
+    def test_defaults_are_safe_and_disable_retries(self) -> None:
+        config = HttpClientConfig()
 
+        self.assertEqual(config.timeout, TimeoutConfig(connect=10, read=10))
+        self.assertEqual(config.pool, PoolConfig())
+        self.assertEqual(config.retry.total, 0)
+        self.assertEqual(
+            config.retry.allowed_methods,
+            frozenset({"GET", "HEAD", "OPTIONS"}),
+        )
+        self.assertEqual(
+            config.retry.status_forcelist,
+            frozenset({429, 500, 502, 503, 504}),
+        )
+        self.assertEqual(config.retry.other, 0)
+        self.assertFalse(config.retry.raise_on_status)
+        self.assertFalse(config.retry.raise_on_redirect)
 
-class BodyReadTimeoutStream(httpx.SyncByteStream):
-    def __init__(self, request: httpx.Request) -> None:
-        self.request = request
-
-    def __iter__(self):
-        raise httpx.ReadTimeout("body read timed out", request=self.request)
-        yield b""
-
-
-class AsyncBodyReadTimeoutStream(httpx.AsyncByteStream):
-    def __init__(self, request: httpx.Request) -> None:
-        self.request = request
-
-    async def __aiter__(self):
-        raise httpx.ReadTimeout("body read timed out", request=self.request)
-        yield b""
-
-
-class HttpClientTests(unittest.TestCase):
-    def test_retry_transport_retries_status_and_then_succeeds(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503 if calls < 3 else 200, json={"calls": calls})
-
-        with HttpClient(
-            client_config(retry=retry_for(total=2)),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            self.assertIsInstance(client.raw_client._transport, RetryTransport)
-            response = client.get("/unstable")
-
-        self.assertEqual(calls, 3)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"calls": 3})
-
-    def test_retry_exhaustion_is_mapped_after_all_transport_attempts(self) -> None:
-        calls = 0
-        mapping = ErrorMappingPolicy(
-            rules=(
-                ErrorMappingRule(
-                    name="inventory-unavailable",
-                    status_codes=frozenset({503}),
-                    raise_as=UpstreamUnavailable,
-                ),
-            )
+    def test_dict_builds_requests_urllib3_and_pool_configuration(self) -> None:
+        config = HttpClientConfig.from_dict(
+            {
+                "base_url": "https://api.example.com/v1",
+                "timeout": {"connect": 2, "read": 7},
+                "headers": {"X-App": "inventory"},
+                "follow_redirects": True,
+                "max_redirects": 4,
+                "verify": "/tmp/ca.pem",
+                "trust_env": False,
+                "pool": {
+                    "connections": 8,
+                    "maxsize": 32,
+                    "block": True,
+                },
+                "retry": {
+                    "total": 4,
+                    "connect": 2,
+                    "read": 1,
+                    "status": 3,
+                    "other": 0,
+                    "allowed_methods": ["get", "post"],
+                    "status_forcelist": [429, 503],
+                    "backoff_factor": 0.25,
+                    "backoff_max": 9,
+                    "backoff_jitter": 0.75,
+                    "respect_retry_after_header": False,
+                    "retry_after_max": 15,
+                },
+            }
         )
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503)
+        self.assertEqual(config.base_url, "https://api.example.com/v1")
+        self.assertEqual(config.timeout, TimeoutConfig(connect=2, read=7))
+        self.assertEqual(
+            config.pool,
+            PoolConfig(connections=8, maxsize=32, block=True),
+        )
+        self.assertEqual(config.retry.total, 4)
+        self.assertEqual(config.retry.connect, 2)
+        self.assertEqual(config.retry.read, 1)
+        self.assertEqual(config.retry.status, 3)
+        self.assertEqual(config.retry.allowed_methods, frozenset({"GET", "POST"}))
+        self.assertEqual(config.retry.status_forcelist, frozenset({429, 503}))
+        self.assertEqual(config.retry.backoff_factor, 0.25)
+        self.assertEqual(config.retry.backoff_max, 9)
+        self.assertEqual(config.retry.backoff_jitter, 0.75)
+        self.assertFalse(config.retry.respect_retry_after_header)
+        self.assertEqual(config.retry.retry_after_max, 15)
+        self.assertFalse(config.retry.raise_on_status)
 
-        with (
-            HttpClient(
-                client_config(
-                    retry=retry_for(total=2),
-                    error_mapping=mapping,
-                ),
-                transport=httpx.MockTransport(handler),
-            ) as client,
-            self.assertRaises(UpstreamUnavailable) as caught,
+    def test_direct_urllib3_retry_is_normalized_for_terminal_mapping(self) -> None:
+        retry = Retry(
+            total=2,
+            allowed_methods={"GET"},
+            status_forcelist={503},
+            raise_on_status=True,
+            raise_on_redirect=True,
+        )
+        config = HttpClientConfig(retry=retry)
+
+        self.assertIsNot(config.retry, retry)
+        self.assertFalse(config.retry.raise_on_status)
+        self.assertFalse(config.retry.raise_on_redirect)
+        self.assertEqual(config.retry.redirect, 0)
+
+    def test_retry_from_dict_uses_organization_defaults(self) -> None:
+        retry = retry_from_dict({"total": 2})
+
+        self.assertIsInstance(retry, Retry)
+        self.assertEqual(retry.total, 2)
+        self.assertEqual(retry.allowed_methods, frozenset({"GET", "HEAD", "OPTIONS"}))
+        self.assertIn(500, retry.status_forcelist)
+        self.assertEqual(retry.retry_after_max, 60)
+
+    def test_empty_status_list_is_allowed_but_empty_methods_are_rejected(self) -> None:
+        retry = retry_from_dict({"total": 1, "status_forcelist": []})
+        self.assertEqual(retry.status_forcelist, frozenset())
+
+        with self.assertRaisesRegex(ValueError, "allowed_methods cannot be empty"):
+            retry_from_dict({"total": 1, "allowed_methods": []})
+
+    def test_raw_retry_cannot_enable_every_method_implicitly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-empty collection"):
+            HttpClientConfig(retry=Retry(total=1, allowed_methods=None))
+
+    def test_custom_retry_subclasses_are_rejected_instead_of_silently_changed(self) -> None:
+        class CustomRetry(Retry):
+            pass
+
+        with self.assertRaisesRegex(TypeError, "subclasses are not supported"):
+            HttpClientConfig(retry=CustomRetry(total=1))
+
+    def test_configuration_is_strict(self) -> None:
+        invalid_values = (
+            {"unknown": True},
+            {"retry": {"total": True}},
+            {"retry": {"backoff_factor": float("nan")}},
+            {"retry": {"allowed_methods": "GET"}},
+            {"timeout": 0},
+            {"pool": {"maxsize": 0}},
+            {"base_url": "api.example.com"},
+            {"base_url": "https://user:secret@example.com"},
+        )
+
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
+                HttpClientConfig.from_dict(value)
+
+    def test_error_mapping_uses_requests_exception_names(self) -> None:
+        config = HttpClientConfig.from_dict(
+            {
+                "error_mapping": {
+                    "rules": [
+                        {
+                            "name": "connect-timeout",
+                            "exceptions": ["ConnectTimeout"],
+                            "raise_as": "system",
+                        }
+                    ]
+                }
+            }
+        )
+
+        rule = config.error_mapping.rules[0]
+        self.assertEqual(rule.exception_types, (requests.ConnectTimeout,))
+
+    def test_public_type_hints_resolve_on_python_39(self) -> None:
+        for target in (
+            TimeoutConfig,
+            PoolConfig,
+            RetryConfig,
+            HttpClientConfig,
+            HttpClient.request,
         ):
-            client.get("/inventory")
+            with self.subTest(target=target):
+                self.assertTrue(get_type_hints(target))
 
-        self.assertEqual(calls, 3)
+    def test_httpx_async_and_vendor_api_are_no_longer_public(self) -> None:
+        self.assertFalse(hasattr(resilient_http, "AsyncHttpClient"))
+        self.assertNotIn("AsyncHttpClient", resilient_http.__all__)
+        self.assertNotIn("_vendor", resilient_http.__all__)
+
+
+class SessionTests(unittest.TestCase):
+    def test_create_session_mounts_retry_adapters_for_both_schemes(self) -> None:
+        config = HttpClientConfig(
+            retry=retry_config(2),
+            pool=PoolConfig(connections=3, maxsize=9, block=True),
+        )
+        session = create_session(config)
+        self.addCleanup(session.close)
+
+        for url in ("http://example.com", "https://example.com"):
+            with self.subTest(url=url):
+                adapter = session.get_adapter(url)
+                self.assertIsInstance(adapter, HTTPAdapter)
+                self.assertIsInstance(adapter.max_retries, Retry)
+                self.assertEqual(adapter.max_retries.total, 2)
+                self.assertEqual(adapter._pool_connections, 3)
+                self.assertEqual(adapter._pool_maxsize, 9)
+                self.assertTrue(adapter._pool_block)
+
+    def test_create_session_applies_headers_tls_environment_and_redirect_limit(self) -> None:
+        session = create_session(
+            HttpClientConfig(
+                headers={"X-App": "orders"},
+                verify="/tmp/ca.pem",
+                trust_env=False,
+                max_redirects=5,
+            )
+        )
+        self.addCleanup(session.close)
+
+        self.assertEqual(session.headers["X-App"], "orders")
+        self.assertEqual(session.verify, "/tmp/ca.pem")
+        self.assertFalse(session.trust_env)
+        self.assertEqual(session.max_redirects, 5)
+
+    def test_default_timeout_redirect_and_base_url_are_applied_per_request(self) -> None:
+        session = RecordingSession()
+        client = HttpClient(
+            HttpClientConfig(
+                base_url="https://api.example.com/v1",
+                timeout={"connect": 2, "read": 8},
+                follow_redirects=False,
+            ),
+            session_factory=lambda: session,
+        )
+        self.addCleanup(client.close)
+
+        response = client.get("/users?active=true")
+
+        self.assertEqual(response.status_code, 200)
+        method, url, kwargs = session.calls[0]
+        self.assertEqual(method, "GET")
+        self.assertEqual(url, "https://api.example.com/v1/users?active=true")
+        self.assertEqual(kwargs["timeout"], (2.0, 8.0))
+        self.assertFalse(kwargs["allow_redirects"])
+
+    def test_per_request_timeout_and_redirect_override_are_preserved(self) -> None:
+        session = RecordingSession()
+        client = HttpClient(
+            HttpClientConfig(),
+            session_factory=lambda: session,
+        )
+        self.addCleanup(client.close)
+
+        client.get(
+            "https://example.com",
+            timeout=(1, 2),
+            allow_redirects=True,
+        )
+
+        kwargs = session.calls[0][2]
+        self.assertEqual(kwargs["timeout"], (1, 2))
+        self.assertTrue(kwargs["allow_redirects"])
+
+    def test_raw_session_and_compatibility_alias_reference_same_session(self) -> None:
+        session = RecordingSession()
+        client = HttpClient(HttpClientConfig(), session_factory=lambda: session)
+        self.addCleanup(client.close)
+
+        self.assertIs(client.raw_session, session)
+        self.assertIs(client.raw_client, session)
+
+    def test_context_manager_closes_owned_session_and_close_is_idempotent(self) -> None:
+        session = RecordingSession()
+        with HttpClient(
+            HttpClientConfig(),
+            session_factory=lambda: session,
+        ) as client:
+            self.assertFalse(session.was_closed)
+
+        self.assertTrue(session.was_closed)
+        client.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            client.get("https://example.com")
+
+
+class HttpClientIntegrationTests(unittest.TestCase):
+    def test_status_retry_succeeds_after_two_failures(self) -> None:
+        with (
+            ScriptedServer(
+                [
+                    (503, {}, b"unavailable"),
+                    (503, {}, b"unavailable"),
+                    (200, {}, b"ok"),
+                ]
+            ) as server,
+            HttpClient(
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(2),
+                )
+            ) as client,
+        ):
+            response = client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(server.requests), 3)
+
+    def test_retry_exhaustion_maps_final_503_with_exact_attempts(self) -> None:
+        with (
+            ScriptedServer([(503, {}, b"unavailable")]) as server,
+            HttpClient(
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(2),
+                )
+            ) as client,
+            self.assertRaises(SystemHttpError) as caught,
+        ):
+            client.get("/health")
+
+        self.assertEqual(len(server.requests), 3)
         self.assertEqual(caught.exception.attempts, 3)
         self.assertEqual(caught.exception.status_code, 503)
-        self.assertEqual(caught.exception.rule_name, "inventory-unavailable")
         self.assertTrue(caught.exception.retry_exhausted)
-        self.assertIsInstance(caught.exception, BaseHttpError)
+        self.assertIsInstance(caught.exception.response, requests.Response)
 
-    def test_caller_extensions_cannot_forge_attempt_count(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503)
-
+    def test_final_non_retryable_status_is_reclassified_without_false_exhaustion(
+        self,
+    ) -> None:
         with (
+            ScriptedServer(
+                [
+                    (503, {}, b"unavailable"),
+                    (400, {}, b"invalid"),
+                ]
+            ) as server,
             HttpClient(
-                client_config(retry=retry_for(total=1)),
-                transport=httpx.MockTransport(handler),
-            ) as client,
-            self.assertRaises(SystemHttpError) as caught,
-        ):
-            client.get(
-                "/",
-                extensions={
-                    "resilient_http.attempts": 999,
-                    "resilient_http.request_state": object(),
-                },
-            )
-
-        self.assertEqual(calls, 2)
-        self.assertEqual(caught.exception.attempts, 2)
-
-    def test_transport_exception_is_retried_and_mapped_with_cause(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            raise httpx.ConnectTimeout("connect timed out", request=request)
-
-        with (
-            HttpClient(
-                client_config(retry=retry_for(total=2)),
-                transport=httpx.MockTransport(handler),
-            ) as client,
-            self.assertRaises(SystemHttpError) as caught,
-        ):
-            client.get("/slow")
-
-        self.assertEqual(calls, 3)
-        self.assertEqual(caught.exception.attempts, 3)
-        self.assertTrue(caught.exception.retry_exhausted)
-        self.assertIsInstance(caught.exception.cause, httpx.ConnectTimeout)
-        self.assertIs(caught.exception.__cause__, caught.exception.cause)
-
-    def test_transport_exception_uses_custom_error_mapping_rule(self) -> None:
-        calls = 0
-        mapping = ErrorMappingPolicy(
-            rules=(
-                ErrorMappingRule(
-                    name="inventory-timeout",
-                    exception_types=(httpx.ConnectTimeout,),
-                    raise_as=UpstreamUnavailable,
-                ),
-            )
-        )
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            raise httpx.ConnectTimeout("connect timed out", request=request)
-
-        with (
-            HttpClient(
-                client_config(
-                    retry=retry_for(total=1),
-                    error_mapping=mapping,
-                ),
-                transport=httpx.MockTransport(handler),
-            ) as client,
-            self.assertRaises(UpstreamUnavailable) as caught,
-        ):
-            client.get("/inventory")
-
-        self.assertEqual(calls, 2)
-        self.assertEqual(caught.exception.attempts, 2)
-        self.assertEqual(caught.exception.rule_name, "inventory-timeout")
-        self.assertIsInstance(caught.exception.cause, httpx.ConnectTimeout)
-
-    def test_final_condition_is_reclassified_without_false_exhaustion(self) -> None:
-        statuses = iter((503, 400))
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(next(statuses))
-
-        with (
-            HttpClient(
-                client_config(retry=retry_for(total=3)),
-                transport=httpx.MockTransport(handler),
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(2),
+                )
             ) as client,
             self.assertRaises(BusinessHttpError) as caught,
         ):
-            client.get("/")
+            client.get("/orders")
 
-        self.assertEqual(calls, 2)
+        self.assertEqual(len(server.requests), 2)
         self.assertEqual(caught.exception.attempts, 2)
         self.assertEqual(caught.exception.status_code, 400)
         self.assertFalse(caught.exception.retry_exhausted)
 
-    def test_non_retryable_post_is_sent_once(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503)
-
+    def test_post_status_is_not_retried_by_default(self) -> None:
         with (
+            ScriptedServer([(503, {}, b"unavailable")]) as server,
             HttpClient(
-                client_config(retry=retry_for(total=3, allowed_methods=("GET",))),
-                transport=httpx.MockTransport(handler),
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(2),
+                )
             ) as client,
             self.assertRaises(SystemHttpError) as caught,
         ):
-            client.post("/orders", json={"amount": 100})
+            client.post("/orders", json={"sku": "A"})
 
-        self.assertEqual(calls, 1)
+        self.assertEqual(len(server.requests), 1)
         self.assertEqual(caught.exception.attempts, 1)
         self.assertFalse(caught.exception.retry_exhausted)
 
-    def test_post_is_retried_when_upstream_retry_allows_it(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503)
-
+    def test_post_can_be_explicitly_retried_with_replayable_body(self) -> None:
         with (
+            ScriptedServer(
+                [
+                    (503, {}, b"unavailable"),
+                    (200, {}, b"ok"),
+                ]
+            ) as server,
             HttpClient(
-                client_config(
-                    retry=retry_for(
-                        total=1,
-                        allowed_methods=("POST",),
-                    )
-                ),
-                transport=httpx.MockTransport(handler),
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(
+                        1,
+                        allowed_methods=frozenset({"GET", "HEAD", "OPTIONS", "POST"}),
+                    ),
+                )
             ) as client,
-            self.assertRaises(SystemHttpError) as caught,
         ):
-            client.post("/orders", json={"amount": 100})
+            response = client.post("/orders", data=io.BytesIO(b"payload"))
 
-        self.assertEqual(calls, 2)
-        self.assertEqual(caught.exception.attempts, 2)
-        self.assertTrue(caught.exception.retry_exhausted)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(server.requests), 2)
+        self.assertEqual([item[2] for item in server.requests], [b"payload", b"payload"])
 
-    @patch("resilient_http._vendor.httpx_retries.retry.time.sleep")
-    def test_retry_after_wait_is_delegated_to_httpx_retries(
-        self,
-        upstream_sleep,
-    ) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(
-                503,
-                headers={"Retry-After": "7"},
-            )
-
-        with HttpClient(
-            client_config(
-                retry=retry_for(total=1),
-                enable_error_mapping=False,
-            ),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            response = client.get("/")
-
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(calls, 2)
-        upstream_sleep.assert_called_once_with(7.0)
-
-    def test_mapping_disabled_returns_final_error_response(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503, json={"error": "unavailable"})
-
-        with HttpClient(
-            client_config(
-                retry=retry_for(total=2),
-                enable_error_mapping=False,
-            ),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            response = client.get("/")
-
-        self.assertEqual(calls, 3)
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json(), {"error": "unavailable"})
-
-    def test_mapping_disabled_propagates_last_httpx_exception_unchanged(self) -> None:
-        calls = 0
-        raised_errors: list[httpx.ConnectTimeout] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            error = httpx.ConnectTimeout("connect timed out", request=request)
-            raised_errors.append(error)
-            raise error
-
+    def test_one_shot_body_is_rejected_before_any_send(self) -> None:
         with (
+            ScriptedServer([(200, {}, b"ok")]) as server,
             HttpClient(
-                client_config(
-                    retry=retry_for(total=1),
-                    enable_error_mapping=False,
-                ),
-                transport=httpx.MockTransport(handler),
-            ) as client,
-            self.assertRaises(httpx.ConnectTimeout) as caught,
-        ):
-            client.get("/")
-
-        self.assertEqual(calls, 2)
-        self.assertIs(caught.exception, raised_errors[-1])
-        self.assertNotIsInstance(caught.exception, BaseHttpError)
-
-    def test_invalid_url_respects_error_mapping_switch(self) -> None:
-        invalid_url = "https://example.test:invalid/"
-
-        with (
-            HttpClient(client_config()) as client,
-            self.assertRaises(SystemHttpError) as caught,
-        ):
-            client.get(invalid_url)
-
-        self.assertEqual(caught.exception.attempts, 1)
-        self.assertEqual(caught.exception.url, "<invalid-url>")
-        self.assertIsInstance(caught.exception.cause, httpx.InvalidURL)
-
-        with (
-            HttpClient(
-                client_config(enable_error_mapping=False),
-            ) as client,
-            self.assertRaises(httpx.InvalidURL),
-        ):
-            client.get(invalid_url)
-
-    def test_default_mapping_sanitizes_business_error_metadata(self) -> None:
-        config = HttpClientConfig(
-            base_url="https://user:pass@example.test",
-            retry=Retry(total=0),
-        )
-
-        with (
-            HttpClient(
-                config,
-                transport=httpx.MockTransport(lambda request: httpx.Response(403)),
-            ) as client,
-            self.assertRaises(BusinessHttpError) as caught,
-        ):
-            client.get("/private?token=secret")
-
-        self.assertEqual(caught.exception.status_code, 403)
-        self.assertEqual(caught.exception.url, "https://example.test/private")
-        self.assertEqual(caught.exception.attempts, 1)
-        self.assertNotIn("secret", str(caught.exception))
-        self.assertNotIn("pass", str(caught.exception))
-
-    def test_one_shot_body_is_rejected_before_retry_transport_sends_it(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503)
-
-        def body():
-            yield b"important-data"
-
-        with (
-            HttpClient(
-                client_config(
-                    retry=retry_for(
-                        total=1,
-                        allowed_methods=("PUT",),
-                    )
-                ),
-                transport=httpx.MockTransport(handler),
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(1),
+                )
             ) as client,
             self.assertRaises(NonReplayableRequestError) as caught,
         ):
-            client.put("/objects/1", content=body())
+            client.post("/upload", data=(part for part in (b"a", b"b")))
 
-        self.assertEqual(calls, 0)
+        self.assertEqual(server.requests, [])
         self.assertEqual(caught.exception.attempts, 0)
 
-    def test_one_shot_body_is_allowed_when_no_retry_condition_exists(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(200)
-
-        def body():
-            yield b"sent-once"
-
-        config = HttpClientConfig.from_dict(
-            {
-                "base_url": "https://example.test",
-                "retry": {
-                    "total": 2,
-                    "allowed_methods": ["PUT"],
-                    "status_forcelist": [],
-                    "retry_on_exceptions": [],
-                },
-            }
+    def test_one_shot_body_is_allowed_when_retries_are_disabled(self) -> None:
+        session = RecordingSession()
+        client = HttpClient(
+            HttpClientConfig(retry=retry_config(0)),
+            session_factory=lambda: session,
         )
-        with HttpClient(
-            config,
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            response = client.put("/objects/1", content=body())
+        self.addCleanup(client.close)
+
+        response = client.post(
+            "https://example.com/upload",
+            data=(part for part in (b"a", b"b")),
+        )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(calls, 1)
+        self.assertEqual(len(session.calls), 1)
 
-    def test_replayable_body_is_identical_on_each_transport_attempt(self) -> None:
-        bodies: list[bytes] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            bodies.append(request.content)
-            return httpx.Response(503)
-
+    def test_one_shot_body_is_rejected_when_redirects_can_replay_it(self) -> None:
         with (
+            ScriptedServer([(307, {"Location": "/target"}, b"")]) as server,
             HttpClient(
-                client_config(
-                    retry=retry_for(
-                        total=1,
-                        allowed_methods=("PUT",),
-                    )
-                ),
-                transport=httpx.MockTransport(handler),
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    follow_redirects=True,
+                    retry=retry_config(0),
+                )
             ) as client,
-            self.assertRaises(SystemHttpError),
+            self.assertRaises(NonReplayableRequestError) as caught,
         ):
-            client.put("/objects/1", content=b"important-data")
+            client.put("/upload", data=(part for part in (b"a", b"b")))
 
-        self.assertEqual(bodies, [b"important-data", b"important-data"])
+        self.assertEqual(server.requests, [])
+        self.assertEqual(caught.exception.attempts, 0)
 
-    def test_body_phase_timeout_is_mapped_but_not_retried_outside_transport(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(200, stream=BodyReadTimeoutStream(request))
-
+    def test_retry_after_header_can_trigger_retry_without_status_forcelist(
+        self,
+    ) -> None:
         with (
+            ScriptedServer(
+                [
+                    (429, {"Retry-After": "0"}, b"slow down"),
+                    (200, {}, b"ok"),
+                ]
+            ) as server,
             HttpClient(
-                client_config(
-                    retry=retry_for(
-                        total=3,
-                        retry_on_exceptions=(httpx.ReadTimeout,),
-                    )
-                ),
-                transport=httpx.MockTransport(handler),
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(
+                        1,
+                        status=1,
+                        status_forcelist=frozenset(),
+                    ),
+                )
+            ) as client,
+        ):
+            response = client.get("/quota")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(server.requests), 2)
+
+    def test_invalid_retry_after_does_not_count_an_unsent_attempt(self) -> None:
+        with (
+            ScriptedServer([(429, {"Retry-After": "not-a-date"}, b"slow down")]) as server,
+            HttpClient(
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(
+                        1,
+                        status=1,
+                        status_forcelist=frozenset(),
+                    ),
+                )
             ) as client,
             self.assertRaises(SystemHttpError) as caught,
         ):
-            client.get("/stream")
+            client.get("/quota")
 
-        self.assertEqual(calls, 1)
+        self.assertEqual(len(server.requests), 1)
         self.assertEqual(caught.exception.attempts, 1)
-        self.assertFalse(caught.exception.retry_exhausted)
-        self.assertIsInstance(caught.exception.cause, httpx.ReadTimeout)
+        self.assertIsInstance(caught.exception.cause, requests.exceptions.InvalidHeader)
 
-    def test_redirect_body_timeout_does_not_claim_retry_exhaustion(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            if request.url.path == "/start":
-                return httpx.Response(
-                    302,
-                    headers={"Location": "/final"},
+    def test_mapping_disabled_returns_final_error_response(self) -> None:
+        with (
+            ScriptedServer([(503, {}, b"unavailable")]) as server,
+            HttpClient(
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(1),
+                    enable_error_mapping=False,
                 )
-            return httpx.Response(
-                200,
-                stream=BodyReadTimeoutStream(request),
-            )
+            ) as client,
+        ):
+            response = client.get("/health")
 
-        config = HttpClientConfig(
-            base_url="https://example.test",
-            follow_redirects=True,
-            retry=retry_for(
-                total=1,
-                retry_on_exceptions=(httpx.ReadTimeout,),
-            ),
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(len(server.requests), 2)
+
+    def test_custom_status_mapping_rule_wins(self) -> None:
+        policy = ErrorMappingPolicy(
+            rules=(
+                ErrorMappingRule(
+                    name="permission-denied",
+                    status_codes=frozenset({403}),
+                    raise_as=PermissionDenied,
+                ),
+            )
         )
         with (
+            ScriptedServer([(403, {}, b"denied")]) as server,
             HttpClient(
-                config,
-                transport=httpx.MockTransport(handler),
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    error_mapping=policy,
+                )
+            ) as client,
+            self.assertRaises(PermissionDenied) as caught,
+        ):
+            client.get("/admin")
+
+        self.assertEqual(caught.exception.rule_name, "permission-denied")
+        self.assertEqual(caught.exception.status_code, 403)
+
+    def test_connect_exhaustion_maps_system_error_with_exact_attempts(self) -> None:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        with (
+            HttpClient(
+                HttpClientConfig(
+                    base_url=f"http://127.0.0.1:{port}",
+                    timeout=0.2,
+                    trust_env=False,
+                    retry=retry_config(
+                        1,
+                        connect=1,
+                        read=0,
+                        status=0,
+                        status_forcelist=frozenset(),
+                    ),
+                )
+            ) as client,
+            self.assertRaises(SystemHttpError) as caught,
+        ):
+            client.get("/offline")
+
+        self.assertEqual(caught.exception.attempts, 2)
+        self.assertTrue(caught.exception.retry_exhausted)
+        self.assertIsInstance(caught.exception.cause, requests.ConnectionError)
+
+    def test_mapping_disabled_propagates_requests_exception(self) -> None:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        with (
+            HttpClient(
+                HttpClientConfig(
+                    base_url=f"http://127.0.0.1:{port}",
+                    timeout=0.2,
+                    trust_env=False,
+                    retry=retry_config(0),
+                    enable_error_mapping=False,
+                )
+            ) as client,
+            self.assertRaises(requests.ConnectionError),
+        ):
+            client.get("/offline")
+
+    def test_invalid_absolute_url_cannot_escape_configured_base_url(self) -> None:
+        with (
+            HttpClient(
+                HttpClientConfig(
+                    base_url="https://api.example.com",
+                    trust_env=False,
+                )
+            ) as client,
+            self.assertRaises(SystemHttpError) as caught,
+        ):
+            client.get("https://other.example.com/secrets")
+
+        self.assertEqual(caught.exception.attempts, 0)
+        self.assertIsInstance(caught.exception.cause, requests.exceptions.InvalidURL)
+
+    def test_error_url_removes_credentials_query_and_fragment(self) -> None:
+        with ScriptedServer([(400, {}, b"invalid")]) as server:
+            address = server.base_url.removeprefix("http://")
+            url = f"http://user:secret@{address}/orders?token=secret#fragment"
+            with (
+                HttpClient(
+                    HttpClientConfig(trust_env=False),
+                ) as client,
+                self.assertRaises(BusinessHttpError) as caught,
+            ):
+                client.get(url)
+
+        self.assertNotIn("user", caught.exception.url)
+        self.assertNotIn("secret", caught.exception.url)
+        self.assertNotIn("token", caught.exception.url)
+        self.assertNotIn("fragment", caught.exception.url)
+        self.assertTrue(caught.exception.url.endswith("/orders"))
+
+    def test_redirect_sends_are_included_in_attempt_count(self) -> None:
+        with (
+            ScriptedServer(
+                [
+                    (503, {}, b"unavailable"),
+                    (302, {"Location": "/final"}, b""),
+                    (400, {}, b"invalid"),
+                ]
+            ) as server,
+            HttpClient(
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    follow_redirects=True,
+                    retry=retry_config(1),
+                )
+            ) as client,
+            self.assertRaises(BusinessHttpError) as caught,
+        ):
+            client.get("/start")
+
+        self.assertEqual(len(server.requests), 3)
+        self.assertEqual(caught.exception.attempts, 3)
+        self.assertFalse(caught.exception.retry_exhausted)
+
+    def test_cross_origin_redirect_is_blocked_before_forwarding_headers(self) -> None:
+        with (
+            ScriptedServer([(200, {}, b"target")]) as target,
+            ScriptedServer([(302, {"Location": f"{target.base_url}/target"}, b"")]) as origin,
+            HttpClient(
+                HttpClientConfig(
+                    base_url=origin.base_url,
+                    headers={"X-Api-Key": "secret"},
+                    trust_env=False,
+                    follow_redirects=True,
+                )
             ) as client,
             self.assertRaises(SystemHttpError) as caught,
         ):
             client.get("/start")
 
-        self.assertEqual(calls, 2)
-        self.assertEqual(caught.exception.attempts, 2)
-        self.assertFalse(caught.exception.retry_exhausted)
-        self.assertIsInstance(caught.exception.cause, httpx.ReadTimeout)
+        self.assertEqual(len(origin.requests), 1)
+        self.assertEqual(origin.requests[0][3]["X-Api-Key"], "secret")
+        self.assertEqual(target.requests, [])
+        self.assertEqual(caught.exception.attempts, 1)
+        self.assertIsInstance(caught.exception.cause, requests.exceptions.InvalidURL)
 
-    def test_unexpected_runtime_error_is_not_mapped(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            raise RuntimeError("programming bug")
-
+    def test_follow_redirects_false_returns_redirect_response(self) -> None:
         with (
+            ScriptedServer(
+                [
+                    (302, {"Location": "/final"}, b""),
+                    (200, {}, b"ok"),
+                ]
+            ) as server,
             HttpClient(
-                client_config(retry=retry_for(total=2)),
-                transport=httpx.MockTransport(handler),
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    follow_redirects=False,
+                )
             ) as client,
-            self.assertRaisesRegex(RuntimeError, "programming bug"),
         ):
-            client.get("/")
+            response = client.get("/start")
 
-    def test_prebuilt_retry_transport_is_rejected(self) -> None:
-        nested = RetryTransport(
-            transport=httpx.MockTransport(lambda request: httpx.Response(200)),
-            retry=retry_for(total=1),
-        )
-        try:
-            with self.assertRaises(ValueError):
-                HttpClient(client_config(), transport=nested)
-        finally:
-            nested.close()
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(len(server.requests), 1)
 
-    def test_context_manager_closes_underlying_client(self) -> None:
-        with HttpClient(
-            client_config(),
-            transport=httpx.MockTransport(lambda request: httpx.Response(200)),
-        ) as client:
-            self.assertFalse(client.raw_client.is_closed)
-            self.assertEqual(client.get("/").status_code, 200)
-
-        self.assertTrue(client.raw_client.is_closed)
-
-
-class AsyncHttpClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_async_retry_transport_retries_and_context_closes(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503 if calls < 3 else 200)
-
-        async with AsyncHttpClient(
-            client_config(retry=retry_for(total=2)),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            self.assertIsInstance(client.raw_client._transport, RetryTransport)
-            self.assertFalse(client.raw_client.is_closed)
-            response = await client.get("/")
-
-        self.assertEqual(calls, 3)
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(client.raw_client.is_closed)
-
-    async def test_async_exhaustion_is_mapped_with_attempts(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503)
-
-        async with AsyncHttpClient(
-            client_config(retry=retry_for(total=1)),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(SystemHttpError) as caught:
-                await client.get("/")
-
-        self.assertEqual(calls, 2)
-        self.assertEqual(caught.exception.attempts, 2)
-        self.assertTrue(caught.exception.retry_exhausted)
-
-    async def test_async_mapping_disabled_propagates_raw_exception(self) -> None:
-        calls = 0
-        raised_errors: list[httpx.ConnectTimeout] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            error = httpx.ConnectTimeout("connect timed out", request=request)
-            raised_errors.append(error)
-            raise error
-
-        async with AsyncHttpClient(
-            client_config(
-                retry=retry_for(total=1),
-                enable_error_mapping=False,
-            ),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(httpx.ConnectTimeout) as caught:
-                await client.get("/")
-
-        self.assertEqual(calls, 2)
-        self.assertIs(caught.exception, raised_errors[-1])
-
-    async def test_async_one_shot_body_is_rejected_before_send(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(503)
-
-        async def body():
-            yield b"important-data"
-
-        async with AsyncHttpClient(
-            client_config(
-                retry=retry_for(
-                    total=1,
-                    allowed_methods=("PUT",),
+    def test_body_read_failure_after_headers_is_not_retried(self) -> None:
+        with (
+            ScriptedServer(
+                [
+                    (
+                        200,
+                        {
+                            "Content-Length": "20",
+                            "Connection": "close",
+                        },
+                        b"short",
+                    )
+                ]
+            ) as server,
+            HttpClient(
+                HttpClientConfig(
+                    base_url=server.base_url,
+                    trust_env=False,
+                    retry=retry_config(2, read=2),
                 )
-            ),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(NonReplayableRequestError) as caught:
-                await client.put("/objects/1", content=body())
+            ) as client,
+            self.assertRaises(SystemHttpError) as caught,
+        ):
+            client.get("/truncated")
 
-        self.assertEqual(calls, 0)
-        self.assertEqual(caught.exception.attempts, 0)
-
-    async def test_async_body_phase_timeout_is_not_retried(self) -> None:
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(
-                200,
-                stream=AsyncBodyReadTimeoutStream(request),
-            )
-
-        async with AsyncHttpClient(
-            client_config(
-                retry=retry_for(
-                    total=3,
-                    retry_on_exceptions=(httpx.ReadTimeout,),
-                )
-            ),
-            transport=httpx.MockTransport(handler),
-        ) as client:
-            with self.assertRaises(SystemHttpError) as caught:
-                await client.get("/stream")
-
-        self.assertEqual(calls, 1)
+        self.assertEqual(len(server.requests), 1)
         self.assertEqual(caught.exception.attempts, 1)
         self.assertFalse(caught.exception.retry_exhausted)
-        self.assertIsInstance(caught.exception.cause, httpx.ReadTimeout)
-
-    async def test_async_prebuilt_retry_transport_is_rejected(self) -> None:
-        nested = RetryTransport(
-            transport=httpx.MockTransport(lambda request: httpx.Response(200)),
-            retry=retry_for(total=1),
+        self.assertIsInstance(
+            caught.exception.cause,
+            requests.exceptions.ChunkedEncodingError,
         )
-        try:
-            with self.assertRaises(ValueError):
-                AsyncHttpClient(client_config(), transport=nested)
-        finally:
-            await nested.aclose()
-
-
-class ConfigurationTests(unittest.TestCase):
-    def test_dict_builds_upstream_retry_and_error_mapping_strictly(self) -> None:
-        config = HttpClientConfig.from_dict(
-            {
-                "base_url": "https://example.test",
-                "timeout": {"connect": 2, "read": 5},
-                "follow_redirects": True,
-                "enable_error_mapping": False,
-                "retry": {
-                    "total": 2,
-                    "allowed_methods": ["GET", "PUT"],
-                    "status_forcelist": [429, 500, 503],
-                    "retry_on_exceptions": [
-                        "ConnectTimeout",
-                        "ReadTimeout",
-                    ],
-                    "backoff_factor": 0,
-                    "max_backoff_wait": 9,
-                    "backoff_jitter": 0,
-                    "respect_retry_after_header": True,
-                },
-                "error_mapping": {
-                    "rules": [
-                        {
-                            "name": "forbidden",
-                            "status_codes": [403],
-                            "raise_as": "business",
-                        }
-                    ]
-                },
-            }
-        )
-
-        self.assertIsInstance(config.retry, Retry)
-        self.assertEqual(config.retry.total, 2)
-        self.assertTrue(config.retry.is_retryable_method("GET"))
-        self.assertTrue(config.retry.is_retryable_method("PUT"))
-        self.assertFalse(config.retry.is_retryable_method("POST"))
-        self.assertEqual(config.retry.status_forcelist, frozenset({429, 500, 503}))
-        self.assertEqual(
-            config.retry.retryable_exceptions,
-            (httpx.ConnectTimeout, httpx.ReadTimeout),
-        )
-        self.assertEqual(config.retry.max_backoff_wait, 9)
-        self.assertFalse(config.enable_error_mapping)
-        self.assertEqual(config.error_mapping.rules[0].name, "forbidden")
-        self.assertIs(
-            config.error_mapping.rules[0].raise_as,
-            BusinessHttpError,
-        )
-
-    def test_dict_rejects_legacy_unknown_and_ambiguous_values(self) -> None:
-        invalid_configs = (
-            {"retry_policy": {}},
-            {"retry": {"rules": []}},
-            {"retry": {"allowed_methods": []}},
-            {"retry": {"retry_on_exceptions": "ConnectTimeout"}},
-            {"retry": {"retry_on_exceptions": ["UnknownHttpxError"]}},
-            {"retry": {"total": True}},
-            {"retry": {"status_forcelist": [500.5]}},
-            {"retry": {"backoff_factor": float("nan")}},
-            {"retry": {"max_backoff_wait": float("inf")}},
-            {"retry": {"backoff_jitter": True}},
-            {"enable_error_mapping": "false"},
-            {"follow_redirects": "true"},
-            {"base_url": None},
-            {"timeout": True},
-            {"headers": None},
-            {"error_mapping": None},
-            {"error_mapping": {"rules": "not-a-list"}},
-            {
-                "error_mapping": {
-                    "rules": [
-                        {
-                            "status_codes": [403],
-                            "raise_as": "business",
-                        }
-                    ]
-                }
-            },
-            {"unknown": True},
-        )
-
-        for config in invalid_configs:
-            with self.subTest(config=config), self.assertRaises((TypeError, ValueError)):
-                HttpClientConfig.from_dict(config)
-
-    def test_empty_status_forcelist_configures_exception_only_retries(
-        self,
-    ) -> None:
-        config = HttpClientConfig.from_dict(
-            {
-                "retry": {
-                    "total": 2,
-                    "status_forcelist": [],
-                    "retry_on_exceptions": ["ConnectTimeout"],
-                }
-            }
-        )
-
-        self.assertFalse(config.retry.is_retryable_status_code(503))
-        request = httpx.Request("GET", "https://example.test")
-        error = httpx.ConnectTimeout("timeout", request=request)
-        self.assertTrue(config.retry.is_retryable_exception(error))
-
-    def test_exception_only_policy_survives_retry_transport_increments(
-        self,
-    ) -> None:
-        config = HttpClientConfig.from_dict(
-            {
-                "base_url": "https://example.test",
-                "enable_error_mapping": False,
-                "retry": {
-                    "total": 2,
-                    "status_forcelist": [],
-                    "retry_on_exceptions": ["ConnectTimeout"],
-                    "backoff_factor": 0,
-                    "backoff_jitter": 0,
-                },
-            }
-        )
-        status_calls = 0
-
-        def status_handler(request: httpx.Request) -> httpx.Response:
-            nonlocal status_calls
-            status_calls += 1
-            return httpx.Response(503)
-
-        with HttpClient(
-            config,
-            transport=httpx.MockTransport(status_handler),
-        ) as client:
-            response = client.get("/")
-
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(status_calls, 1)
-
-        exception_calls = 0
-
-        def exception_handler(request: httpx.Request) -> httpx.Response:
-            nonlocal exception_calls
-            exception_calls += 1
-            raise httpx.ConnectTimeout("timeout", request=request)
-
-        with (
-            HttpClient(
-                config,
-                transport=httpx.MockTransport(exception_handler),
-            ) as client,
-            self.assertRaises(httpx.ConnectTimeout),
-        ):
-            client.get("/")
-
-        self.assertEqual(exception_calls, 3)
-
-    def test_direct_retry_instance_is_preserved(self) -> None:
-        retry = retry_for(total=4)
-        config = HttpClientConfig(retry=retry)
-
-        self.assertIs(config.retry, retry)
-
-    def test_incremented_retry_instance_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "attempts_made"):
-            HttpClientConfig(retry=retry_for(total=2).increment())
-
-    def test_default_configuration_disables_retries(self) -> None:
-        config = HttpClientConfig()
-
-        self.assertEqual(config.retry.total, 0)
-
-    def test_direct_timeout_object_is_validated(self) -> None:
-        for value in (-1.0, float("nan"), float("inf")):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                HttpClientConfig(timeout=httpx.Timeout(value))
-
-    def test_public_type_hints_resolve_on_python_39(self) -> None:
-        targets = (
-            HttpClientConfig,
-            ErrorMappingRule,
-            BaseHttpError.__init__,
-            HttpClient.request,
-            AsyncHttpClient.request,
-        )
-
-        for target in targets:
-            with self.subTest(target=target):
-                self.assertTrue(get_type_hints(target))
-
-    def test_legacy_retry_types_are_not_public(self) -> None:
-        self.assertFalse(hasattr(resilient_http, "BackoffConfig"))
-        self.assertFalse(hasattr(resilient_http, "RetryPolicy"))
-        self.assertFalse(hasattr(resilient_http, "RetryRule"))
 
 
 if __name__ == "__main__":

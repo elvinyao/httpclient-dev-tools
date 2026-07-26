@@ -1,60 +1,21 @@
-"""HTTPX clients with upstream retries and optional domain-error mapping."""
+"""Synchronous organization-level HTTP client built on Requests."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator, Mapping
-from typing import Any, NoReturn, Optional, Union
+from collections.abc import Iterator, Mapping
+from typing import Any, Callable, NoReturn, Optional, Union
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
-import httpx
+import requests
+from urllib3.exceptions import MaxRetryError
+from urllib3.util import Retry
 
-from ._vendor.httpx_retries import Retry, RetryTransport
-from .config import ErrorMappingRule, HttpClientConfig
+from ._adapters import AttemptState, build_adapter, track_attempts
+from .config import ErrorMappingRule, HttpClientConfig, TimeoutConfig
 from .exceptions import BaseHttpError, NonReplayableRequestError
 
 ConfigInput = Union[HttpClientConfig, Mapping[str, Any]]
-Url = Union[str, httpx.URL]
-
-_REQUEST_STATE_EXTENSION = "resilient_http.request_state"
-
-
-class _RequestState:
-    """Mutable state shared by retries and redirect requests."""
-
-    __slots__ = ("attempts", "transport_completed")
-
-    def __init__(self) -> None:
-        self.attempts = 0
-        self.transport_completed = False
-
-
-def _request_state(
-    request: httpx.Request,
-    *,
-    create: bool = False,
-) -> Optional[_RequestState]:
-    state = request.extensions.get(_REQUEST_STATE_EXTENSION)
-    if isinstance(state, _RequestState):
-        return state
-    if not create:
-        return None
-
-    state = _RequestState()
-    request.extensions[_REQUEST_STATE_EXTENSION] = state
-    return state
-
-
-def _prepare_request_extensions(kwargs: dict[str, Any]) -> None:
-    raw_extensions = kwargs.get("extensions")
-    if raw_extensions is None:
-        extensions: dict[str, Any] = {}
-    elif isinstance(raw_extensions, Mapping):
-        extensions = dict(raw_extensions)
-    else:
-        raise TypeError("request extensions must be a mapping")
-
-    # Never trust or mutate caller-owned extension state.
-    extensions[_REQUEST_STATE_EXTENSION] = _RequestState()
-    kwargs["extensions"] = extensions
+SessionFactory = Callable[[], requests.Session]
 
 
 def _config_from_value(config: ConfigInput) -> HttpClientConfig:
@@ -68,288 +29,224 @@ def _config_from_value(config: ConfigInput) -> HttpClientConfig:
 def _configured_retry(config: HttpClientConfig) -> Retry:
     retry = config.retry
     if not isinstance(retry, Retry):  # Defensive: __post_init__ normalizes it.
-        raise TypeError("config.retry must be a resilient_http.Retry")
+        raise TypeError("config.retry must be an urllib3 Retry")
     return retry
 
 
-class _AttemptTrackingTransport(httpx.BaseTransport):
-    """Observe physical sends without making any retry decisions."""
+def create_session(
+    config: ConfigInput,
+    *,
+    session_factory: SessionFactory = requests.Session,
+) -> requests.Session:
+    """Create one reusable Requests Session with organization defaults."""
 
-    def __init__(self, transport: httpx.BaseTransport) -> None:
-        self._transport = transport
+    resolved = _config_from_value(config)
+    session = session_factory()
+    if not isinstance(session, requests.Session):
+        raise TypeError("session_factory must return a requests.Session")
 
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        state = _request_state(request, create=True)
-        assert state is not None
-        state.attempts += 1
-        state.transport_completed = False
-        response = self._transport.handle_request(request)
-        state.transport_completed = True
-        return response
-
-    def close(self) -> None:
-        self._transport.close()
-
-
-class _AsyncAttemptTrackingTransport(httpx.AsyncBaseTransport):
-    """Asynchronous physical-send observer."""
-
-    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
-        self._transport = transport
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        state = _request_state(request, create=True)
-        assert state is not None
-        state.attempts += 1
-        state.transport_completed = False
-        response = await self._transport.handle_async_request(request)
-        state.transport_completed = True
-        return response
-
-    async def aclose(self) -> None:
-        await self._transport.aclose()
+    session.headers.update(resolved.headers)
+    session.verify = resolved.verify
+    session.trust_env = resolved.trust_env
+    session.max_redirects = resolved.max_redirects
+    session.mount("http://", build_adapter(_configured_retry(resolved), resolved.pool))
+    session.mount("https://", build_adapter(_configured_retry(resolved), resolved.pool))
+    return session
 
 
-def _sync_retry_transport(
-    retry: Retry,
-    transport: Optional[httpx.BaseTransport],
-) -> RetryTransport:
-    if isinstance(transport, RetryTransport):
-        raise ValueError(
-            "transport must be the underlying transport, not RetryTransport; "
-            "this client installs exactly one vendored retry layer"
+def _resolve_url(config: HttpClientConfig, url: str) -> str:
+    if not isinstance(url, str):
+        raise TypeError("url must be a string")
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError as error:
+        raise requests.exceptions.InvalidURL("url must be a valid URL") from error
+
+    if not config.base_url:
+        return url
+    if parsed.scheme or parsed.netloc:
+        raise requests.exceptions.InvalidURL("url must be relative when HttpClientConfig.base_url is configured")
+
+    # Stripping the leading slash makes base paths stable: base_url=/api and
+    # url=/users resolve to /api/users rather than escaping to /users.
+    return urljoin(f"{config.base_url}/", url.lstrip("/"))
+
+
+def _safe_url(url: str) -> str:
+    """Remove credentials, query values, and fragments from error metadata."""
+
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return "<invalid-url>"
+
+    if hostname is None:
+        safe_netloc = ""
+    else:
+        safe_host = f"[{hostname}]" if ":" in hostname else hostname
+        safe_netloc = f"{safe_host}:{port}" if port is not None else safe_host
+    return urlunsplit(
+        (
+            parsed.scheme,
+            safe_netloc,
+            parsed.path,
+            "",
+            "",
         )
-    if transport is not None and not isinstance(transport, httpx.BaseTransport):
-        raise TypeError("transport must be an httpx.BaseTransport")
-    inner = transport if transport is not None else httpx.HTTPTransport()
-    return RetryTransport(
-        transport=_AttemptTrackingTransport(inner),
-        retry=retry,
     )
 
 
-def _async_retry_transport(
-    retry: Retry,
-    transport: Optional[httpx.AsyncBaseTransport],
-) -> RetryTransport:
-    if isinstance(transport, RetryTransport):
-        raise ValueError(
-            "transport must be the underlying transport, not RetryTransport; "
-            "this client installs exactly one vendored retry layer"
-        )
-    if transport is not None and not isinstance(transport, httpx.AsyncBaseTransport):
-        raise TypeError("transport must be an httpx.AsyncBaseTransport")
-    inner = transport if transport is not None else httpx.AsyncHTTPTransport()
-    return RetryTransport(
-        transport=_AsyncAttemptTrackingTransport(inner),
-        retry=retry,
-    )
+def _request_details(
+    fallback_method: str,
+    fallback_url: str,
+    *,
+    response: Optional[requests.Response] = None,
+    error: Optional[requests.RequestException] = None,
+) -> tuple[str, str]:
+    prepared: Optional[requests.PreparedRequest] = None
+    if response is not None:
+        prepared = response.request
+    elif error is not None:
+        prepared = error.request
+        if prepared is None and error.response is not None:
+            prepared = error.response.request
+
+    if prepared is not None:
+        return prepared.method or fallback_method, _safe_url(prepared.url or fallback_url)
+    return fallback_method.upper(), _safe_url(fallback_url)
 
 
-def _method_can_retry(retry: Retry, method: str) -> bool:
-    if retry.total <= retry.attempts_made:
+def _retry_limit(retry: Retry, category: str) -> int:
+    total = retry.total
+    if isinstance(total, bool) or not isinstance(total, int) or total <= 0:
+        return 0
+
+    category_limit = getattr(retry, category)
+    if category_limit is None:
+        return total
+    if isinstance(category_limit, bool) or not isinstance(category_limit, int):
+        return 0
+    return max(0, min(total, category_limit))
+
+
+def _method_is_retryable(retry: Retry, method: str) -> bool:
+    methods = retry.allowed_methods
+    return bool(methods) and method.upper() in methods
+
+
+def _retry_may_resend_body(retry: Retry, method: str) -> bool:
+    if _retry_limit(retry, "connect") > 0 or _retry_limit(retry, "other") > 0:
+        return True
+    if not _method_is_retryable(retry, method):
         return False
-    has_retryable_status = any(isinstance(code, int) and 100 <= code <= 599 for code in retry.status_forcelist)
-    if not has_retryable_status and not retry.retryable_exceptions:
+    return _retry_limit(retry, "read") > 0 or _retry_limit(retry, "status") > 0
+
+
+def _is_replayable_file(value: Any) -> bool:
+    tell = getattr(value, "tell", None)
+    seek = getattr(value, "seek", None)
+    if not callable(tell) or not callable(seek):
         return False
     try:
-        return retry.is_retryable_method(method)
-    except ValueError:
+        position = tell()
+        seek(position)
+    except (OSError, ValueError):
         return False
-
-
-def _is_one_shot(value: Any) -> bool:
-    return isinstance(
-        value,
-        (
-            Iterator,
-            AsyncIterator,
-            httpx.SyncByteStream,
-            httpx.AsyncByteStream,
-        ),
-    )
-
-
-def _files_are_replayable(files: Any) -> bool:
-    if isinstance(files, Mapping):
-        values = list(files.values())
-    elif isinstance(files, (list, tuple)):
-        values = []
-        for item in files:
-            if not isinstance(item, (list, tuple)) or len(item) < 2:
-                return False
-            values.append(item[1])
-    else:
-        return False
-
-    for value in values:
-        payload = value
-        if isinstance(value, tuple):
-            if len(value) < 2:
-                return False
-            payload = value[1]
-        if not isinstance(payload, (bytes, bytearray, memoryview, str)):
-            return False
     return True
 
 
 def _non_replayable_body_reason(kwargs: Mapping[str, Any]) -> Optional[str]:
-    content = kwargs.get("content")
-    if content is not None and _is_one_shot(content):
-        return "content is a one-shot iterator or stream"
-
     data = kwargs.get("data")
-    if data is not None and _is_one_shot(data):
-        return "data is a one-shot iterator or stream"
-
-    files = kwargs.get("files")
-    if files is not None and not _files_are_replayable(files):
-        return "files contain an open stream instead of in-memory data"
-
+    if data is None or isinstance(
+        data,
+        (str, bytes, bytearray, memoryview, Mapping, list, tuple),
+    ):
+        return None
+    if hasattr(data, "read"):
+        if _is_replayable_file(data):
+            return None
+        return "data is a stream that cannot be rewound"
+    if isinstance(data, Iterator):
+        return "data is a one-shot iterator"
+    try:
+        if iter(data) is data:
+            return "data is a one-shot iterable"
+    except TypeError:
+        return None
     return None
 
 
 def _reject_non_replayable_body(
     retry: Retry,
     method: str,
-    url: Url,
+    url: str,
     kwargs: Mapping[str, Any],
+    *,
+    redirects_enabled: bool,
 ) -> None:
-    if not _method_can_retry(retry, method):
+    if not redirects_enabled and not _retry_may_resend_body(retry, method):
         return
-
     reason = _non_replayable_body_reason(kwargs)
     if reason is None:
         return
 
     safe_url = _safe_url(url)
     raise NonReplayableRequestError(
-        f"{method.upper()} {safe_url} cannot be retried safely: {reason}",
-        method=method.upper(),
+        f"{method} {safe_url} cannot be retried safely: {reason}",
+        method=method,
         url=safe_url,
         attempts=0,
     )
 
 
-def _safe_url(url: Url) -> str:
-    """Remove credentials, query values, and fragments from error metadata."""
-
-    try:
-        parsed = httpx.URL(url)
-        return str(
-            parsed.copy_with(
-                username=None,
-                password=None,
-                query=None,
-                fragment=None,
-            )
-        )
-    except (TypeError, ValueError, httpx.InvalidURL):
-        return "<invalid-url>"
-
-
-def _request_from_error(error: Exception) -> Optional[httpx.Request]:
-    if not isinstance(error, httpx.RequestError):
-        return None
-    try:
-        return error.request
-    except RuntimeError:
-        return None
-
-
-def _request_details(
-    fallback_method: str,
-    fallback_url: Url,
-    *,
-    response: Optional[httpx.Response] = None,
-    error: Optional[Exception] = None,
-) -> tuple[str, str]:
-    request: Optional[httpx.Request] = None
-    if response is not None:
-        try:
-            request = response.request
-        except RuntimeError:
-            request = None
-    elif error is not None:
-        request = _request_from_error(error)
-
-    if request is not None:
-        return request.method, _safe_url(request.url)
-    return fallback_method.upper(), _safe_url(fallback_url)
-
-
-def _attempts_from_request(request: Optional[httpx.Request]) -> int:
-    if request is None:
-        return 1
-    state = _request_state(request)
-    if state is not None and state.attempts >= 1:
-        return state.attempts
-    return 1
-
-
-def _attempts_for_response(response: httpx.Response) -> int:
-    try:
-        request = response.request
-    except RuntimeError:
-        request = None
-    return _attempts_from_request(request)
-
-
-def _attempts_for_error(error: Exception) -> int:
-    return _attempts_from_request(_request_from_error(error))
-
-
-def _transport_completed_for_error(error: Exception) -> bool:
-    request = _request_from_error(error)
-    if request is None:
-        return False
-    state = _request_state(request)
-    return state is not None and state.transport_completed
-
-
-def _retry_budget_exhausted(retry: Retry, attempts: int) -> bool:
-    remaining_retries = retry.total - retry.attempts_made
-    return remaining_retries > 0 and attempts >= remaining_retries + 1
+def _contains_max_retry_error(error: BaseException) -> bool:
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, MaxRetryError):
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        pending.extend(value for value in current.args if isinstance(value, BaseException))
+    return False
 
 
 def _status_retry_exhausted(
     retry: Retry,
     method: str,
-    status_code: int,
-    attempts: int,
+    response: requests.Response,
+    state: AttemptState,
 ) -> bool:
-    if not _retry_budget_exhausted(retry, attempts):
+    if state.retries == 0 or _retry_limit(retry, "status") == 0:
         return False
-    try:
-        return retry.is_retryable_method(method) and retry.is_retryable_status_code(status_code)
-    except ValueError:
-        return False
-
-
-def _exception_retry_exhausted(
-    retry: Retry,
-    method: str,
-    error: Exception,
-    attempts: int,
-) -> bool:
-    if not _retry_budget_exhausted(retry, attempts):
-        return False
-    try:
-        return retry.is_retryable_method(method) and retry.is_retryable_exception(error)
-    except ValueError:
-        return False
+    has_retry_after = "Retry-After" in response.headers
+    return retry.is_retry(
+        method,
+        response.status_code,
+        has_retry_after=has_retry_after,
+    )
 
 
 def _raise_failure(
     error_type: type[BaseHttpError],
     *,
-    retry: Retry,
     fallback_method: str,
-    fallback_url: Url,
+    fallback_url: str,
     attempts: int,
+    retry_exhausted: bool,
     rule: Optional[ErrorMappingRule],
-    response: Optional[httpx.Response] = None,
-    cause: Optional[Exception] = None,
+    response: Optional[requests.Response] = None,
+    cause: Optional[requests.RequestException] = None,
 ) -> NoReturn:
     method, url = _request_details(
         fallback_method,
@@ -361,35 +258,21 @@ def _raise_failure(
     rule_name = rule.name if rule is not None else None
 
     if status_code is not None:
-        retry_exhausted = _status_retry_exhausted(
-            retry,
-            method,
-            status_code,
-            attempts,
-        )
         reason = f"HTTP {status_code}"
     elif cause is not None:
-        if _transport_completed_for_error(cause):
-            retry_exhausted = False
-        else:
-            retry_exhausted = _exception_retry_exhausted(
-                retry,
-                method,
-                cause,
-                attempts,
-            )
         reason = type(cause).__name__
     else:
-        retry_exhausted = False
         reason = "unknown HTTP failure"
 
-    message = "{} {} failed with {} after {} attempt{}".format(
-        method,
-        url,
-        reason,
-        attempts,
-        "" if attempts == 1 else "s",
+    suffix = (
+        "before sending"
+        if attempts == 0
+        else "after {} attempt{}".format(
+            attempts,
+            "" if attempts == 1 else "s",
+        )
     )
+    message = f"{method} {url} failed with {reason} {suffix}"
     raised = error_type(
         message,
         method=method,
@@ -407,243 +290,135 @@ def _raise_failure(
 
 
 class HttpClient:
-    """Synchronous HTTPX client using the vendored retry transport."""
+    """Reusable synchronous Requests client with standardized policy."""
 
     def __init__(
         self,
         config: ConfigInput,
         *,
-        transport: Optional[httpx.BaseTransport] = None,
+        session_factory: SessionFactory = requests.Session,
     ) -> None:
         self.config = _config_from_value(config)
         self.retry = _configured_retry(self.config)
-
-        client_options: dict[str, Any] = {
-            "timeout": self.config.timeout,
-            "headers": self.config.headers,
-            "follow_redirects": self.config.follow_redirects,
-            "transport": _sync_retry_transport(self.retry, transport),
-        }
-        if self.config.base_url:
-            client_options["base_url"] = self.config.base_url
-        self._client = httpx.Client(**client_options)
+        self._session = create_session(
+            self.config,
+            session_factory=session_factory,
+        )
+        self._closed = False
 
     @property
-    def raw_client(self) -> httpx.Client:
-        """Underlying HTTPX client; mapping and replay-safety checks are bypassed."""
+    def raw_session(self) -> requests.Session:
+        """Underlying Session; direct calls bypass timeout and error mapping."""
 
-        return self._client
+        return self._session
+
+    @property
+    def raw_client(self) -> requests.Session:
+        """Compatibility alias for ``raw_session``."""
+
+        return self._session
 
     def request(
         self,
         method: str,
-        url: Url,
+        url: str,
         **kwargs: Any,
-    ) -> httpx.Response:
-        normalized_method = method.upper()
-        _reject_non_replayable_body(
-            self.retry,
-            normalized_method,
-            url,
-            kwargs,
-        )
-        _prepare_request_extensions(kwargs)
+    ) -> requests.Response:
+        if self._closed:
+            raise RuntimeError("HttpClient is closed")
+        if not isinstance(method, str) or not method.strip():
+            raise TypeError("method must be a non-empty string")
 
-        try:
-            # This is intentionally the only logical request call. RetryTransport
-            # owns every physical retry, retry decision, and backoff.
-            response = self._client.request(normalized_method, url, **kwargs)
-        except httpx.RequestError as error:
-            if not self.config.enable_error_mapping:
-                raise
-            rule = self.config.error_mapping.for_exception(error)
-            error_type = rule.raise_as if rule is not None else self.config.error_mapping.default_system_error
-            _raise_failure(
-                error_type,
-                retry=self.retry,
-                fallback_method=normalized_method,
-                fallback_url=url,
-                attempts=_attempts_for_error(error),
-                rule=rule,
-                cause=error,
-            )
-        except httpx.InvalidURL as error:
-            if not self.config.enable_error_mapping:
-                raise
-            _raise_failure(
-                self.config.error_mapping.default_system_error,
-                retry=self.retry,
-                fallback_method=normalized_method,
-                fallback_url=url,
-                attempts=1,
-                rule=None,
-                cause=error,
-            )
+        normalized_method = method.strip().upper()
+        resolved_url = url
 
-        if not response.is_error or not self.config.enable_error_mapping:
+        timeout = self.config.timeout
+        if not isinstance(timeout, TimeoutConfig):  # Defensive normalization.
+            raise TypeError("config.timeout must be a TimeoutConfig")
+        kwargs.setdefault("timeout", timeout.as_requests_value())
+        kwargs.setdefault("allow_redirects", self.config.follow_redirects)
+
+        with track_attempts() as state:
+            try:
+                resolved_url = _resolve_url(self.config, url)
+                _reject_non_replayable_body(
+                    self.retry,
+                    normalized_method,
+                    resolved_url,
+                    kwargs,
+                    redirects_enabled=bool(kwargs["allow_redirects"]),
+                )
+                response = self._session.request(
+                    normalized_method,
+                    resolved_url,
+                    **kwargs,
+                )
+                if state.attempts == 0:
+                    # A custom Session may return a synthetic/cached Response
+                    # without entering the mounted adapter pipeline.
+                    state.attempts = 1
+            except requests.RequestException as error:
+                if not self.config.enable_error_mapping:
+                    raise
+                rule = self.config.error_mapping.for_exception(error)
+                error_type = rule.raise_as if rule is not None else self.config.error_mapping.default_system_error
+                _raise_failure(
+                    error_type,
+                    fallback_method=normalized_method,
+                    fallback_url=resolved_url,
+                    attempts=state.attempts,
+                    retry_exhausted=(state.retries > 0 and _contains_max_retry_error(error)),
+                    rule=rule,
+                    cause=error,
+                )
+
+            if not response.ok and self.config.enable_error_mapping:
+                rule = self.config.error_mapping.for_status(response.status_code)
+                if rule is not None:
+                    error_type = rule.raise_as
+                elif 400 <= response.status_code < 500:
+                    error_type = self.config.error_mapping.default_business_error
+                else:
+                    error_type = self.config.error_mapping.default_system_error
+
+                _raise_failure(
+                    error_type,
+                    fallback_method=normalized_method,
+                    fallback_url=resolved_url,
+                    attempts=state.attempts,
+                    retry_exhausted=_status_retry_exhausted(
+                        self.retry,
+                        normalized_method,
+                        response,
+                        state,
+                    ),
+                    rule=rule,
+                    response=response,
+                )
             return response
 
-        rule = self.config.error_mapping.for_status(response.status_code)
-        if rule is not None:
-            error_type = rule.raise_as
-        elif 400 <= response.status_code < 500:
-            error_type = self.config.error_mapping.default_business_error
-        else:
-            error_type = self.config.error_mapping.default_system_error
-
-        _raise_failure(
-            error_type,
-            retry=self.retry,
-            fallback_method=normalized_method,
-            fallback_url=url,
-            attempts=_attempts_for_response(response),
-            rule=rule,
-            response=response,
-        )
-
-    def get(self, url: Url, **kwargs: Any) -> httpx.Response:
+    def get(self, url: str, **kwargs: Any) -> requests.Response:
         return self.request("GET", url, **kwargs)
 
-    def post(self, url: Url, **kwargs: Any) -> httpx.Response:
+    def post(self, url: str, **kwargs: Any) -> requests.Response:
         return self.request("POST", url, **kwargs)
 
-    def put(self, url: Url, **kwargs: Any) -> httpx.Response:
+    def put(self, url: str, **kwargs: Any) -> requests.Response:
         return self.request("PUT", url, **kwargs)
 
-    def patch(self, url: Url, **kwargs: Any) -> httpx.Response:
+    def patch(self, url: str, **kwargs: Any) -> requests.Response:
         return self.request("PATCH", url, **kwargs)
 
-    def delete(self, url: Url, **kwargs: Any) -> httpx.Response:
+    def delete(self, url: str, **kwargs: Any) -> requests.Response:
         return self.request("DELETE", url, **kwargs)
 
     def close(self) -> None:
-        self._client.close()
+        if not self._closed:
+            self._session.close()
+            self._closed = True
 
     def __enter__(self) -> HttpClient:
         return self
 
     def __exit__(self, *args: Any) -> None:
         self.close()
-
-
-class AsyncHttpClient:
-    """Asynchronous HTTPX client using the vendored retry transport."""
-
-    def __init__(
-        self,
-        config: ConfigInput,
-        *,
-        transport: Optional[httpx.AsyncBaseTransport] = None,
-    ) -> None:
-        self.config = _config_from_value(config)
-        self.retry = _configured_retry(self.config)
-
-        client_options: dict[str, Any] = {
-            "timeout": self.config.timeout,
-            "headers": self.config.headers,
-            "follow_redirects": self.config.follow_redirects,
-            "transport": _async_retry_transport(self.retry, transport),
-        }
-        if self.config.base_url:
-            client_options["base_url"] = self.config.base_url
-        self._client = httpx.AsyncClient(**client_options)
-
-    @property
-    def raw_client(self) -> httpx.AsyncClient:
-        """Underlying HTTPX client; mapping and replay-safety checks are bypassed."""
-
-        return self._client
-
-    async def request(
-        self,
-        method: str,
-        url: Url,
-        **kwargs: Any,
-    ) -> httpx.Response:
-        normalized_method = method.upper()
-        _reject_non_replayable_body(
-            self.retry,
-            normalized_method,
-            url,
-            kwargs,
-        )
-        _prepare_request_extensions(kwargs)
-
-        try:
-            # RetryTransport owns all physical asynchronous attempts.
-            response = await self._client.request(
-                normalized_method,
-                url,
-                **kwargs,
-            )
-        except httpx.RequestError as error:
-            if not self.config.enable_error_mapping:
-                raise
-            rule = self.config.error_mapping.for_exception(error)
-            error_type = rule.raise_as if rule is not None else self.config.error_mapping.default_system_error
-            _raise_failure(
-                error_type,
-                retry=self.retry,
-                fallback_method=normalized_method,
-                fallback_url=url,
-                attempts=_attempts_for_error(error),
-                rule=rule,
-                cause=error,
-            )
-        except httpx.InvalidURL as error:
-            if not self.config.enable_error_mapping:
-                raise
-            _raise_failure(
-                self.config.error_mapping.default_system_error,
-                retry=self.retry,
-                fallback_method=normalized_method,
-                fallback_url=url,
-                attempts=1,
-                rule=None,
-                cause=error,
-            )
-
-        if not response.is_error or not self.config.enable_error_mapping:
-            return response
-
-        rule = self.config.error_mapping.for_status(response.status_code)
-        if rule is not None:
-            error_type = rule.raise_as
-        elif 400 <= response.status_code < 500:
-            error_type = self.config.error_mapping.default_business_error
-        else:
-            error_type = self.config.error_mapping.default_system_error
-
-        _raise_failure(
-            error_type,
-            retry=self.retry,
-            fallback_method=normalized_method,
-            fallback_url=url,
-            attempts=_attempts_for_response(response),
-            rule=rule,
-            response=response,
-        )
-
-    async def get(self, url: Url, **kwargs: Any) -> httpx.Response:
-        return await self.request("GET", url, **kwargs)
-
-    async def post(self, url: Url, **kwargs: Any) -> httpx.Response:
-        return await self.request("POST", url, **kwargs)
-
-    async def put(self, url: Url, **kwargs: Any) -> httpx.Response:
-        return await self.request("PUT", url, **kwargs)
-
-    async def patch(self, url: Url, **kwargs: Any) -> httpx.Response:
-        return await self.request("PATCH", url, **kwargs)
-
-    async def delete(self, url: Url, **kwargs: Any) -> httpx.Response:
-        return await self.request("DELETE", url, **kwargs)
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-    async def __aenter__(self) -> AsyncHttpClient:
-        return self
-
-    async def __aexit__(self, *args: Any) -> None:
-        await self.aclose()

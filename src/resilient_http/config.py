@@ -1,4 +1,4 @@
-"""Configuration for HTTPX retries and optional domain-error mapping."""
+"""Strict configuration for the organization-level Requests client."""
 
 from __future__ import annotations
 
@@ -6,43 +6,43 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
+from urllib.parse import urlsplit
 
-import httpx
+import requests
+from urllib3.util import Retry
 
-from ._vendor.httpx_retries import Retry
 from .exceptions import BaseHttpError, BusinessHttpError, SystemHttpError
 
-HttpxErrorType = type[httpx.RequestError]
+RequestsErrorType = type[requests.RequestException]
 RaisedErrorType = type[BaseHttpError]
-RetryInput = Union[Retry, Mapping[str, Any]]
-TimeoutValue = Union[float, httpx.Timeout]
 
-_NO_RETRY_STATUS = -1
+DEFAULT_RETRY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+DEFAULT_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
-_HTTPX_ERROR_TYPES: dict[str, HttpxErrorType] = {
-    name: getattr(httpx, name)
+_REQUESTS_ERROR_TYPES: dict[str, RequestsErrorType] = {
+    name: getattr(requests.exceptions, name)
     for name in (
-        "RequestError",
-        "TransportError",
-        "TimeoutException",
+        "RequestException",
+        "ConnectionError",
+        "HTTPError",
+        "URLRequired",
+        "TooManyRedirects",
         "ConnectTimeout",
         "ReadTimeout",
-        "WriteTimeout",
-        "PoolTimeout",
-        "NetworkError",
-        "ConnectError",
-        "ReadError",
-        "WriteError",
-        "CloseError",
-        "ProtocolError",
-        "LocalProtocolError",
-        "RemoteProtocolError",
+        "Timeout",
+        "InvalidURL",
+        "InvalidHeader",
+        "InvalidSchema",
+        "MissingSchema",
         "ProxyError",
-        "UnsupportedProtocol",
-        "DecodingError",
-        "TooManyRedirects",
+        "SSLError",
+        "ChunkedEncodingError",
+        "ContentDecodingError",
+        "StreamConsumedError",
+        "RetryError",
+        "UnrewindableBodyError",
     )
-    if hasattr(httpx, name)
+    if hasattr(requests.exceptions, name)
 }
 
 _RAISED_ERROR_TYPES: dict[str, RaisedErrorType] = {
@@ -50,28 +50,6 @@ _RAISED_ERROR_TYPES: dict[str, RaisedErrorType] = {
     "businesshttperror": BusinessHttpError,
     "system": SystemHttpError,
     "systemhttperror": SystemHttpError,
-}
-
-_RETRY_KEYS = {
-    "total",
-    "allowed_methods",
-    "status_forcelist",
-    "retry_on_exceptions",
-    "backoff_factor",
-    "respect_retry_after_header",
-    "max_backoff_wait",
-    "backoff_jitter",
-}
-
-_LEGACY_RETRY_KEYS = {
-    "backoff",
-    "exception_types",
-    "exceptions",
-    "max_attempts",
-    "raise_as",
-    "retry_methods",
-    "rules",
-    "status_codes",
 }
 
 
@@ -102,6 +80,12 @@ def _strict_integer(
     if maximum is not None and value > maximum:
         raise ValueError(f"{name} must be at most {maximum}")
     return value
+
+
+def _optional_retry_count(value: Any, name: str) -> Optional[int]:
+    if value is None:
+        return None
+    return _strict_integer(value, name, minimum=0)
 
 
 def _finite_number(
@@ -140,16 +124,18 @@ def _ordered_values(value: Any, name: str) -> tuple[Any, ...]:
     return tuple(value)
 
 
-def _resolve_httpx_error_type(value: Union[str, HttpxErrorType]) -> HttpxErrorType:
+def _resolve_requests_error_type(
+    value: Union[str, RequestsErrorType],
+) -> RequestsErrorType:
     if isinstance(value, str):
         try:
-            return _HTTPX_ERROR_TYPES[value]
+            return _REQUESTS_ERROR_TYPES[value]
         except KeyError as error:
-            supported = ", ".join(sorted(_HTTPX_ERROR_TYPES))
-            raise ValueError(f"Unknown HTTPX exception {value!r}; supported names: {supported}") from error
+            supported = ", ".join(sorted(_REQUESTS_ERROR_TYPES))
+            raise ValueError(f"Unknown Requests exception {value!r}; supported names: {supported}") from error
 
-    if not isinstance(value, type) or not issubclass(value, httpx.RequestError):
-        raise TypeError("Exception types must be names or subclasses of httpx.RequestError")
+    if not isinstance(value, type) or not issubclass(value, requests.RequestException):
+        raise TypeError("Exception types must be names or subclasses of requests.RequestException")
     return value
 
 
@@ -168,32 +154,291 @@ def _resolve_raised_error_type(
     return value
 
 
+@dataclass(frozen=True)
+class TimeoutConfig:
+    """Per-attempt Requests connect and read timeouts in seconds."""
+
+    connect: float = 10.0
+    read: float = 10.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "connect",
+            _finite_number(
+                self.connect,
+                "timeout.connect",
+                minimum=0,
+                exclusive_minimum=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "read",
+            _finite_number(
+                self.read,
+                "timeout.read",
+                minimum=0,
+                exclusive_minimum=True,
+            ),
+        )
+
+    def as_requests_value(self) -> tuple[float, float]:
+        return (self.connect, self.read)
+
+    @classmethod
+    def from_value(cls, value: Any) -> TimeoutConfig:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, Mapping):
+            _unknown_keys(value, {"default", "connect", "read"}, "timeout")
+            default = _finite_number(
+                value.get("default", 10.0),
+                "timeout.default",
+                minimum=0,
+                exclusive_minimum=True,
+            )
+            return cls(
+                connect=value.get("connect", default),
+                read=value.get("read", default),
+            )
+        if isinstance(value, (tuple, list)):
+            if len(value) != 2:
+                raise ValueError("timeout sequence must contain connect and read values")
+            return cls(connect=value[0], read=value[1])
+
+        timeout = _finite_number(
+            value,
+            "timeout",
+            minimum=0,
+            exclusive_minimum=True,
+        )
+        return cls(connect=timeout, read=timeout)
+
+
+@dataclass(frozen=True)
+class PoolConfig:
+    """Requests HTTPAdapter connection-pool settings."""
+
+    connections: int = 10
+    maxsize: int = 10
+    block: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "connections",
+            _strict_integer(self.connections, "pool.connections", minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "maxsize",
+            _strict_integer(self.maxsize, "pool.maxsize", minimum=1),
+        )
+        object.__setattr__(self, "block", _strict_bool(self.block, "pool.block"))
+
+    @classmethod
+    def from_value(cls, value: Any) -> PoolConfig:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError("pool must be a PoolConfig or mapping")
+        _unknown_keys(value, {"connections", "maxsize", "block"}, "pool")
+        return cls(
+            connections=value.get("connections", 10),
+            maxsize=value.get("maxsize", 10),
+            block=value.get("block", False),
+        )
+
+
+@dataclass(frozen=True)
+class RetryConfig:
+    """Organization defaults used to construct ``urllib3.util.Retry``."""
+
+    total: int = 0
+    connect: Optional[int] = None
+    read: Optional[int] = None
+    status: Optional[int] = None
+    other: int = 0
+    allowed_methods: frozenset[str] = field(default_factory=lambda: DEFAULT_RETRY_METHODS)
+    status_forcelist: frozenset[int] = field(default_factory=lambda: DEFAULT_RETRY_STATUSES)
+    backoff_factor: float = 0.5
+    backoff_max: float = 30.0
+    backoff_jitter: float = 0.5
+    respect_retry_after_header: bool = True
+    retry_after_max: int = 60
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "total",
+            _strict_integer(self.total, "retry.total", minimum=0),
+        )
+        for name in ("connect", "read", "status"):
+            object.__setattr__(
+                self,
+                name,
+                _optional_retry_count(getattr(self, name), f"retry.{name}"),
+            )
+        object.__setattr__(
+            self,
+            "other",
+            _strict_integer(self.other, "retry.other", minimum=0),
+        )
+
+        raw_methods = _iterable_values(self.allowed_methods, "retry.allowed_methods")
+        if not raw_methods:
+            raise ValueError("retry.allowed_methods cannot be empty; use total=0 to disable retries")
+        methods = []
+        for index, method in enumerate(raw_methods):
+            if not isinstance(method, str) or not method.strip():
+                raise TypeError(f"retry.allowed_methods[{index}] must be a non-empty string")
+            methods.append(method.strip().upper())
+        object.__setattr__(self, "allowed_methods", frozenset(methods))
+
+        raw_statuses = _iterable_values(
+            self.status_forcelist,
+            "retry.status_forcelist",
+        )
+        statuses = frozenset(
+            _strict_integer(
+                code,
+                f"retry.status_forcelist[{index}]",
+                minimum=400,
+                maximum=599,
+            )
+            for index, code in enumerate(raw_statuses)
+        )
+        object.__setattr__(self, "status_forcelist", statuses)
+
+        object.__setattr__(
+            self,
+            "backoff_factor",
+            _finite_number(
+                self.backoff_factor,
+                "retry.backoff_factor",
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "backoff_max",
+            _finite_number(
+                self.backoff_max,
+                "retry.backoff_max",
+                minimum=0,
+                exclusive_minimum=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "backoff_jitter",
+            _finite_number(
+                self.backoff_jitter,
+                "retry.backoff_jitter",
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "respect_retry_after_header",
+            _strict_bool(
+                self.respect_retry_after_header,
+                "retry.respect_retry_after_header",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "retry_after_max",
+            _strict_integer(
+                self.retry_after_max,
+                "retry.retry_after_max",
+                minimum=0,
+            ),
+        )
+
+    def build(self) -> Retry:
+        return Retry(
+            total=self.total,
+            connect=self.connect,
+            read=self.read,
+            redirect=0,
+            status=self.status,
+            other=self.other,
+            allowed_methods=self.allowed_methods,
+            status_forcelist=self.status_forcelist,
+            backoff_factor=self.backoff_factor,
+            backoff_max=self.backoff_max,
+            raise_on_redirect=False,
+            raise_on_status=False,
+            respect_retry_after_header=self.respect_retry_after_header,
+            backoff_jitter=self.backoff_jitter,
+            retry_after_max=self.retry_after_max,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> RetryConfig:
+        if not isinstance(data, Mapping):
+            raise TypeError("retry must be a mapping")
+        _unknown_keys(
+            data,
+            {
+                "total",
+                "connect",
+                "read",
+                "status",
+                "other",
+                "allowed_methods",
+                "status_forcelist",
+                "backoff_factor",
+                "backoff_max",
+                "backoff_jitter",
+                "respect_retry_after_header",
+                "retry_after_max",
+            },
+            "retry",
+        )
+        return cls(
+            total=data.get("total", 0),
+            connect=data.get("connect"),
+            read=data.get("read"),
+            status=data.get("status"),
+            other=data.get("other", 0),
+            allowed_methods=data.get("allowed_methods", DEFAULT_RETRY_METHODS),
+            status_forcelist=data.get("status_forcelist", DEFAULT_RETRY_STATUSES),
+            backoff_factor=data.get("backoff_factor", 0.5),
+            backoff_max=data.get("backoff_max", 30.0),
+            backoff_jitter=data.get("backoff_jitter", 0.5),
+            respect_retry_after_header=data.get(
+                "respect_retry_after_header",
+                True,
+            ),
+            retry_after_max=data.get("retry_after_max", 60),
+        )
+
+
+RetryInput = Union[RetryConfig, Retry, Mapping[str, Any]]
+
+
 def _validate_retry_instance(retry: Retry) -> Retry:
-    if retry.attempts_made != 0:
-        raise ValueError("retry.attempts_made must be 0; configure a fresh Retry instance")
-
+    if type(retry) is not Retry:
+        raise TypeError(
+            "custom urllib3 Retry subclasses are not supported; use RetryConfig or an unmodified urllib3.util.Retry"
+        )
     _strict_integer(retry.total, "retry.total", minimum=0)
-    _finite_number(retry.backoff_factor, "retry.backoff_factor", minimum=0)
-    _finite_number(
-        retry.max_backoff_wait,
-        "retry.max_backoff_wait",
-        minimum=0,
-        exclusive_minimum=True,
-    )
-    _finite_number(
-        retry.backoff_jitter,
-        "retry.backoff_jitter",
-        minimum=0,
-        maximum=1,
-    )
-    _strict_bool(
-        retry.respect_retry_after_header,
-        "retry.respect_retry_after_header",
-    )
+    for name in ("connect", "read", "status", "other"):
+        _optional_retry_count(getattr(retry, name), f"retry.{name}")
 
-    for index, code in enumerate(retry.status_forcelist):
-        if code == _NO_RETRY_STATUS:
-            continue
+    methods = retry.allowed_methods
+    if methods is None or not methods:
+        raise ValueError(
+            "retry.allowed_methods must be a non-empty collection; use RetryConfig for organization-safe defaults"
+        )
+    for index, method in enumerate(methods):
+        if not isinstance(method, str) or not method.strip():
+            raise TypeError(f"retry.allowed_methods[{index}] must be a non-empty string")
+
+    for index, code in enumerate(retry.status_forcelist or ()):
         _strict_integer(
             code,
             f"retry.status_forcelist[{index}]",
@@ -201,123 +446,47 @@ def _validate_retry_instance(retry: Retry) -> Retry:
             maximum=599,
         )
 
-    for index, error_type in enumerate(retry.retryable_exceptions):
-        if not isinstance(error_type, type) or not issubclass(
-            error_type,
-            httpx.RequestError,
-        ):
-            raise TypeError(f"retry.retry_on_exceptions[{index}] must be a subclass of httpx.RequestError")
-    return retry
-
-
-def retry_from_dict(data: Mapping[str, Any]) -> Retry:
-    """Build the Python 3.9-compatible vendored ``Retry`` configuration."""
-
-    if not isinstance(data, Mapping):
-        raise TypeError("retry must be a mapping")
-
-    legacy = set(data) & _LEGACY_RETRY_KEYS
-    if legacy:
-        names = ", ".join(sorted(legacy))
-        raise ValueError(
-            f"Legacy retry key(s) are no longer supported: {names}. "
-            "Use total=max_attempts-1, allowed_methods, status_forcelist, "
-            "and retry_on_exceptions; move raise_as to error_mapping"
-        )
-    _unknown_keys(data, _RETRY_KEYS, "retry")
-
-    total = _strict_integer(data.get("total", 0), "retry.total", minimum=0)
-
-    allowed_methods: Optional[tuple[str, ...]] = None
-    if "allowed_methods" in data and data["allowed_methods"] is not None:
-        values = _iterable_values(
-            data["allowed_methods"],
-            "retry.allowed_methods",
-        )
-        if not values:
-            raise ValueError(
-                "retry.allowed_methods cannot be empty with httpx-retries 0.4.6; "
-                "set total=0 and omit allowed_methods to disable retries"
-            )
-
-        normalized_methods = []
-        for index, method in enumerate(values):
-            if not isinstance(method, str) or not method.strip():
-                raise TypeError(f"retry.allowed_methods[{index}] must be a non-empty string")
-            normalized_methods.append(method.strip().upper())
-        allowed_methods = tuple(normalized_methods)
-
-    status_forcelist: Optional[tuple[int, ...]] = None
-    if "status_forcelist" in data and data["status_forcelist"] is not None:
-        values = _iterable_values(
-            data["status_forcelist"],
-            "retry.status_forcelist",
-        )
-        statuses = tuple(
-            _strict_integer(
-                code,
-                f"retry.status_forcelist[{index}]",
-                minimum=400,
-                maximum=599,
-            )
-            for index, code in enumerate(values)
-        )
-        # Retry 0.4.6 treats an empty iterable as "use defaults". A sentinel
-        # preserves the intended exception-only policy across increment().
-        status_forcelist = statuses or (_NO_RETRY_STATUS,)
-
-    retry_on_exceptions: Optional[tuple[HttpxErrorType, ...]] = None
-    if "retry_on_exceptions" in data and data["retry_on_exceptions"] is not None:
-        values = _iterable_values(
-            data["retry_on_exceptions"],
-            "retry.retry_on_exceptions",
-        )
-        retry_on_exceptions = tuple(_resolve_httpx_error_type(value) for value in values)
-
-    backoff_factor = _finite_number(
-        data.get("backoff_factor", 0.0),
-        "retry.backoff_factor",
-        minimum=0,
-    )
-    max_backoff_wait = _finite_number(
-        data.get("max_backoff_wait", 120.0),
-        "retry.max_backoff_wait",
+    _finite_number(retry.backoff_factor, "retry.backoff_factor", minimum=0)
+    _finite_number(
+        retry.backoff_max,
+        "retry.backoff_max",
         minimum=0,
         exclusive_minimum=True,
     )
-    backoff_jitter = _finite_number(
-        data.get("backoff_jitter", 1.0),
-        "retry.backoff_jitter",
-        minimum=0,
-        maximum=1,
-    )
-    respect_retry_after_header = _strict_bool(
-        data.get("respect_retry_after_header", True),
+    _finite_number(retry.backoff_jitter, "retry.backoff_jitter", minimum=0)
+    _strict_bool(
+        retry.respect_retry_after_header,
         "retry.respect_retry_after_header",
     )
+    _strict_integer(
+        retry.retry_after_max,
+        "retry.retry_after_max",
+        minimum=0,
+    )
 
-    try:
-        retry = Retry(
-            total=total,
-            allowed_methods=allowed_methods,
-            status_forcelist=status_forcelist,
-            retry_on_exceptions=retry_on_exceptions,
-            backoff_factor=backoff_factor,
-            respect_retry_after_header=respect_retry_after_header,
-            max_backoff_wait=max_backoff_wait,
-            backoff_jitter=backoff_jitter,
-        )
-    except ValueError as error:
-        raise ValueError(f"Invalid retry configuration: {error}") from error
-    return _validate_retry_instance(retry)
+    # The policy layer must receive the final response so it can map 4xx/5xx.
+    # Requests, rather than urllib3, owns redirects.
+    return retry.new(
+        redirect=0,
+        raise_on_redirect=False,
+        raise_on_status=False,
+    )
+
+
+def retry_from_dict(data: Mapping[str, Any]) -> Retry:
+    """Build an organization-safe ``urllib3.util.Retry`` policy."""
+
+    return RetryConfig.from_dict(data).build()
 
 
 def _retry_from_value(value: RetryInput) -> Retry:
+    if isinstance(value, RetryConfig):
+        return value.build()
     if isinstance(value, Retry):
         return _validate_retry_instance(value)
     if isinstance(value, Mapping):
         return retry_from_dict(value)
-    raise TypeError("retry must be a resilient_http.Retry or a mapping")
+    raise TypeError("retry must be a RetryConfig, urllib3 Retry, or mapping")
 
 
 @dataclass(frozen=True)
@@ -327,7 +496,7 @@ class ErrorMappingRule:
     name: str
     raise_as: RaisedErrorType
     status_codes: frozenset[int] = field(default_factory=frozenset)
-    exception_types: tuple[HttpxErrorType, ...] = field(default_factory=tuple)
+    exception_types: tuple[RequestsErrorType, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -350,7 +519,7 @@ class ErrorMappingRule:
             self.exception_types,
             "exception_types",
         )
-        exception_types = tuple(_resolve_httpx_error_type(value) for value in raw_exceptions)
+        exception_types = tuple(_resolve_requests_error_type(value) for value in raw_exceptions)
         object.__setattr__(self, "exception_types", exception_types)
 
         if not status_codes and not exception_types:
@@ -364,7 +533,7 @@ class ErrorMappingRule:
     def matches_status(self, status_code: int) -> bool:
         return status_code in self.status_codes
 
-    def matches_exception(self, error: httpx.RequestError) -> bool:
+    def matches_exception(self, error: requests.RequestException) -> bool:
         return bool(self.exception_types) and isinstance(
             error,
             self.exception_types,
@@ -409,7 +578,7 @@ class ErrorMappingRule:
             name=data["name"],
             raise_as=_resolve_raised_error_type(data["raise_as"]),
             status_codes=frozenset(status_values),
-            exception_types=tuple(_resolve_httpx_error_type(value) for value in error_values),
+            exception_types=tuple(_resolve_requests_error_type(value) for value in error_values),
         )
 
 
@@ -452,7 +621,7 @@ class ErrorMappingPolicy:
 
     def for_exception(
         self,
-        error: httpx.RequestError,
+        error: requests.RequestException,
     ) -> Optional[ErrorMappingRule]:
         return next(
             (rule for rule in self.rules if rule.matches_exception(error)),
@@ -499,52 +668,26 @@ class ErrorMappingPolicy:
         )
 
 
-def _timeout_from_value(value: Any) -> TimeoutValue:
-    if isinstance(value, httpx.Timeout):
-        for component in ("connect", "read", "write", "pool"):
-            timeout = getattr(value, component)
-            if timeout is not None:
-                _finite_number(
-                    timeout,
-                    f"timeout.{component}",
-                    minimum=0,
-                )
-        return value
-    if isinstance(value, Mapping):
-        _unknown_keys(
-            value,
-            {"default", "connect", "read", "write", "pool"},
-            "timeout",
-        )
-        default = _finite_number(
-            value.get("default", 10.0),
-            "timeout.default",
-            minimum=0,
-        )
-        return httpx.Timeout(
-            default,
-            connect=_finite_number(
-                value.get("connect", default),
-                "timeout.connect",
-                minimum=0,
-            ),
-            read=_finite_number(
-                value.get("read", default),
-                "timeout.read",
-                minimum=0,
-            ),
-            write=_finite_number(
-                value.get("write", default),
-                "timeout.write",
-                minimum=0,
-            ),
-            pool=_finite_number(
-                value.get("pool", default),
-                "timeout.pool",
-                minimum=0,
-            ),
-        )
-    return _finite_number(value, "timeout", minimum=0)
+def _base_url_from_value(value: Any) -> str:
+    if not isinstance(value, str):
+        raise TypeError("base_url must be a string")
+    if not value:
+        return ""
+
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("base_url must be a valid absolute HTTP(S) URL") from error
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base_url must be an absolute HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("base_url must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("base_url must not contain a query or fragment")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("base_url port must be between 1 and 65535")
+    return value.rstrip("/")
 
 
 def _headers_from_value(value: Any) -> dict[str, str]:
@@ -559,31 +702,45 @@ def _headers_from_value(value: Any) -> dict[str, str]:
     return headers
 
 
-def _default_retry() -> Retry:
-    # Upstream defaults to ten retries. Shared clients should opt in explicitly.
-    return Retry(total=0)
+def _verify_from_value(value: Any) -> Union[bool, str]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value:
+        return value
+    raise TypeError("verify must be a boolean or a non-empty CA bundle path")
 
 
 @dataclass(frozen=True)
 class HttpClientConfig:
-    """Top-level client configuration."""
+    """Top-level organization HTTP-client configuration."""
 
     base_url: str = ""
-    timeout: TimeoutValue = 10.0
+    timeout: Union[
+        TimeoutConfig,
+        float,
+        tuple[float, float],
+        Mapping[str, Any],
+    ] = field(default_factory=TimeoutConfig)
     headers: Mapping[str, str] = field(default_factory=dict)
     follow_redirects: bool = False
-    retry: RetryInput = field(default_factory=_default_retry)
+    max_redirects: int = 10
+    verify: Union[bool, str] = True
+    trust_env: bool = True
+    pool: Union[PoolConfig, Mapping[str, Any]] = field(default_factory=PoolConfig)
+    retry: RetryInput = field(default_factory=RetryConfig)
     enable_error_mapping: bool = True
-    error_mapping: ErrorMappingPolicy = field(default_factory=ErrorMappingPolicy)
+    error_mapping: Union[ErrorMappingPolicy, Mapping[str, Any]] = field(default_factory=ErrorMappingPolicy)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.base_url, str):
-            raise TypeError("base_url must be a string")
-
+        object.__setattr__(
+            self,
+            "base_url",
+            _base_url_from_value(self.base_url),
+        )
         object.__setattr__(
             self,
             "timeout",
-            _timeout_from_value(self.timeout),
+            TimeoutConfig.from_value(self.timeout),
         )
         object.__setattr__(
             self,
@@ -597,9 +754,17 @@ class HttpClientConfig:
         )
         object.__setattr__(
             self,
-            "retry",
-            _retry_from_value(self.retry),
+            "max_redirects",
+            _strict_integer(self.max_redirects, "max_redirects", minimum=0),
         )
+        object.__setattr__(self, "verify", _verify_from_value(self.verify))
+        object.__setattr__(
+            self,
+            "trust_env",
+            _strict_bool(self.trust_env, "trust_env"),
+        )
+        object.__setattr__(self, "pool", PoolConfig.from_value(self.pool))
+        object.__setattr__(self, "retry", _retry_from_value(self.retry))
         object.__setattr__(
             self,
             "enable_error_mapping",
@@ -623,7 +788,7 @@ class HttpClientConfig:
             raise TypeError("HTTP client configuration must be a mapping")
         if "retry_policy" in data:
             raise ValueError(
-                "retry_policy was removed; configure the vendored Retry under retry "
+                "retry_policy was removed; configure urllib3 Retry under retry "
                 "and terminal exception mapping under error_mapping"
             )
 
@@ -634,6 +799,10 @@ class HttpClientConfig:
                 "timeout",
                 "headers",
                 "follow_redirects",
+                "max_redirects",
+                "verify",
+                "trust_env",
+                "pool",
                 "retry",
                 "enable_error_mapping",
                 "error_mapping",
@@ -646,7 +815,11 @@ class HttpClientConfig:
             timeout=data.get("timeout", 10.0),
             headers=data.get("headers", {}),
             follow_redirects=data.get("follow_redirects", False),
-            retry=data.get("retry", {"total": 0}),
+            max_redirects=data.get("max_redirects", 10),
+            verify=data.get("verify", True),
+            trust_env=data.get("trust_env", True),
+            pool=data.get("pool", {}),
+            retry=data.get("retry", {}),
             enable_error_mapping=data.get("enable_error_mapping", True),
             error_mapping=data.get("error_mapping", {}),
         )

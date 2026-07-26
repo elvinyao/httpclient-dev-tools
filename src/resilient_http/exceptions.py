@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-import httpx
+import requests
 
 
 class BaseHttpError(Exception):
@@ -24,7 +24,7 @@ class BaseHttpError(Exception):
         rule_name: Optional[str] = None,
         status_code: Optional[int] = None,
         retry_exhausted: bool = False,
-        response: Optional[httpx.Response] = None,
+        response: Optional[requests.Response] = None,
         cause: Optional[Exception] = None,
     ) -> None:
         super().__init__(message)

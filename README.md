@@ -1,270 +1,138 @@
 # Resilient HTTP Client
 
-一个面向多个 Python APP 的轻量 HTTP 客户端：
+一个供多个 Python APP 共用的组织级同步 HTTP Client 规范层。
 
-- HTTP 发送、连接池由 HTTPX 负责。
-- 所有重试均由内置的 `httpx-retries 0.4.6` 源码快照负责，本项目不再实现重试循环。
-- 可选的异常映射层将最终失败转换为业务系统可处理的异常。
-- 同时提供同步 `HttpClient` 和异步 `AsyncHttpClient`。
-- 支持 Python 3.9。
+- HTTP 发送、连接复用和连接池由 [Requests](https://requests.readthedocs.io/) 负责。
+- 重试判断、指数退避和 `Retry-After` 由
+  [`urllib3.util.Retry`](https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html#urllib3.util.Retry)
+  负责。
+- 本项目负责严格配置、安全默认值、Session 生命周期、最终异常映射和必要的请求安全检查。
+- 默认把最终 4xx 映射为业务异常，把最终 5xx 和 Requests 网络异常映射为系统异常。
+- 只提供同步客户端，支持 Python 3.9 及以上版本。
 
-## 安装与开发
+本项目不是新的 Retry 实现，也不复制或内置 Requests/urllib3 源码。
 
-项目使用 uv 管理：
+## 安装和开发
+
+业务 APP 从组织包源安装：
+
+```bash
+uv add resilient-http-client
+```
+
+本地联调也可以添加项目目录：
+
+```bash
+uv add --editable ../namagi-dev-tools
+```
+
+开发环境使用 uv 管理：
 
 ```bash
 uv sync
+uv lock --check
 ```
 
-运行测试和代码检查：
+运行测试、Ruff 检查和构建：
 
 ```bash
 uv run python -m unittest discover -s tests -v
 uv run ruff check .
 uv run ruff format --check .
+uv build
 ```
 
-自动修复与格式化：
+自动修复和格式化：
 
 ```bash
 uv run ruff check . --fix
 uv run ruff format .
 ```
 
-依赖统一通过 `uv add`/`uv remove` 管理，并提交更新后的 `uv.lock`。业务 APP
-只需要依赖本项目，不需要再安装单独的 `httpx-retries` distribution；HTTPX
-仍是正常的运行时依赖。
+最低版本验证：
 
-## Vendored httpx-retries
-
-项目在私有命名空间 `resilient_http._vendor.httpx_retries` 中内置上游
-`httpx-retries 0.4.6`，因为这是最后一个支持 Python 3.9 的版本。业务代码
-不得直接导入 `_vendor`；稳定入口是 `from resilient_http import Retry`。
-
-vendored Python 源码保持上游原样，来源、版本、commit、更新流程和 MIT
-许可证保存在：
-
-- `src/resilient_http/_vendor/httpx_retries/VENDORED.md`
-- `src/resilient_http/_vendor/httpx_retries/LICENSE`
-
-构建出的 wheel 不会提供顶层 `httpx_retries` 包，避免和业务 APP 的其他依赖
-发生同名覆盖。
-
-## 重试次数的语义
-
-`httpx-retries` 使用 `total` 表示“首次请求之后最多再重试几次”：
-
-```text
-Retry(total=0)  = 不重试，最多发送 1 次
-Retry(total=2)  = 最多重试 2 次，最多发送 3 次
-Retry(total=n)  = 最多重试 n 次，最多发送 n + 1 次
+```bash
+uv run --python 3.9 python -m unittest discover -s tests -v
 ```
 
-`HttpClientConfig` 默认使用 `Retry(total=0)`，即默认不重试。请注意，上游
-直接创建 `Retry()` 时默认是 `total=10`。
+依赖通过 `uv add`、`uv remove` 管理，并提交同步更新后的 `pyproject.toml` 和
+`uv.lock`。
 
-## 直接传入 Retry
+## Python 3.9 兼容策略
 
-需要 Python 对象配置时，使用本项目公开的 `Retry`：
+项目声明：
 
-```python
-import httpx
-
-from resilient_http import HttpClient, HttpClientConfig, Retry
-
-
-retry = Retry(
-    total=3,
-    allowed_methods={"GET", "HEAD", "PUT", "DELETE"},
-    status_forcelist={429, 500, 502, 503, 504},
-    retry_on_exceptions=(
-        httpx.ConnectTimeout,
-        httpx.ReadTimeout,
-        httpx.ConnectError,
-    ),
-    backoff_factor=0.5,
-    max_backoff_wait=30,
-    backoff_jitter=1.0,
-    respect_retry_after_header=True,
-)
-
-config = HttpClientConfig(
-    base_url="https://api.example.com",
-    retry=retry,
-)
-
-with HttpClient(config) as client:
-    response = client.get("/users/123")
+```toml
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.32.5,<3",
+    "urllib3>=2.6.3,<3",
+]
 ```
 
-`allowed_methods`、`status_forcelist` 和 `retry_on_exceptions` 共用同一个
-`total`。0.4.6 不支持“500 重试 2 次、429 重试 5 次”这类按条件设置不同次数
-的策略。
+Requests 和 urllib3 都是直接依赖：本项目直接导入 `urllib3.util.Retry`，不能只
+依赖 Requests 的传递依赖。
 
-指数退避也完全采用上游语义：基础值为
-`backoff_factor * 2 ** attempts_made`，然后应用 `backoff_jitter` 比例并受
-`max_backoff_wait` 限制。大于 0 的有效 `Retry-After` 会优先于指数退避，同样受
-`max_backoff_wait` 限制；`backoff_factor=0` 时，除 `Retry-After` 外不主动
-等待。
+uv 根据每个发行版的 `Requires-Python` 为不同 Python 版本生成分叉解析。当前
+`uv.lock` 在 Python 3.9 使用 Requests 2.32.5 和 urllib3 2.6.3，在 Python
+3.10 及以上使用允许范围内的较新版本。每次升级依赖后都应至少重新运行 Python
+3.9 测试和默认开发版本测试。
 
-如果未显式指定集合，上游 0.4.6 的默认值为：
+Ruff 的目标版本为 `py39`。公开类型注解避免依赖只能在 Python 3.10 及以上正确
+求值的写法。
 
-- 方法：`HEAD`、`GET`、`PUT`、`DELETE`、`OPTIONS`、`TRACE`
-- 状态码：`429`、`502`、`503`、`504`，不包含 `500`
-- 异常：`TimeoutException`、`NetworkError`、`RemoteProtocolError`
+## 快速开始：完整 dict 配置
 
-`POST` 和 `PATCH` 默认不会重试。只有服务端支持幂等键或重复执行确实安全时，
-才应将它们加入 `allowed_methods`。
-
-传入的 `Retry` 必须是尚未执行 `increment()` 的新对象，即
-`attempts_made=0`。为避免把程序错误当作网络错误重试，本客户端还要求
-`retry_on_exceptions` 中的类型继承 `httpx.RequestError`。
-
-0.4.6 在 Python 3.9 中用固定的标准 HTTP method enum 判断重试方法，因此
-`PROPFIND` 等扩展方法即使在 `total=0` 时也会在发送前抛出 `ValueError`。
-本客户端保持这一上游限制，只面向该版本支持的标准方法。
-
-## 使用 dict 配置
-
-来自 JSON、YAML 或环境配置的 mapping 可以直接传给客户端：
+来自 JSON、YAML 或环境配置的 mapping 可以直接传给 `HttpClient`。未知字段、
+错误类型以及不安全的空方法集合会在启动阶段失败，而不是等到第一次请求时才暴露。
 
 ```python
-from resilient_http import HttpClient
+from resilient_http import BusinessHttpError, HttpClient, SystemHttpError
 
 
 config = {
-    "base_url": "https://api.example.com",
+    "base_url": "https://api.example.com/v1",
     "timeout": {
-        "default": 10,
         "connect": 3,
         "read": 20,
     },
+    "headers": {
+        "User-Agent": "inventory-app/1.0",
+        "X-App": "inventory",
+    },
+    "follow_redirects": False,
+    "max_redirects": 10,
+    "verify": True,
+    "trust_env": True,
+    "pool": {
+        "connections": 10,
+        "maxsize": 20,
+        "block": False,
+    },
     "retry": {
         "total": 3,
-        "allowed_methods": ["GET", "HEAD", "PUT", "DELETE"],
+        "connect": 3,
+        "read": 1,
+        "status": 2,
+        "other": 0,
+        "allowed_methods": ["GET", "HEAD", "OPTIONS"],
         "status_forcelist": [429, 500, 502, 503, 504],
-        "retry_on_exceptions": [
-            "ConnectTimeout",
-            "ReadTimeout",
-            "ConnectError",
-        ],
         "backoff_factor": 0.5,
-        "max_backoff_wait": 30,
-        "backoff_jitter": 1.0,
+        "backoff_max": 30,
+        "backoff_jitter": 0.5,
         "respect_retry_after_header": True,
-    },
-}
-
-with HttpClient(config) as client:
-    response = client.get("/users/123")
-```
-
-dict 中的 retry 字段与 `Retry` 0.4.6 构造参数同名。异常既可以使用受支持的
-HTTPX 异常名称，也可以在 Python mapping 中直接传入 `httpx.RequestError`
-子类。
-
-省略集合字段表示使用上游默认值。若只想重试异常，可显式设置
-`"status_forcelist": []`；若只想重试状态码，可设置
-`"retry_on_exceptions": []`。由于 0.4.6 对空方法集合会错误地恢复默认方法，
-`allowed_methods` 不接受空集合；完全禁用重试请使用 `total=0` 并省略该字段。
-
-## 可选业务异常映射
-
-异常层级如下：
-
-```text
-BaseHttpError
-├── BusinessHttpError
-└── SystemHttpError
-    └── NonReplayableRequestError
-```
-
-映射后的异常提供 `method`、已移除认证信息/query/fragment 的 `url`、
-`attempts`、`status_code`、`rule_name`、`retry_exhausted`、`response` 和
-`cause`。`attempts` 统计该逻辑请求实际经过 Transport 的发送次数，包括重试
-和 redirect。`retry_exhausted=True` 只表示最终条件本来可重试且已用完大于
-0 的重试预算；`total=0`、遇到不可重试的最终条件，或错误发生在 Transport
-返回后的 body 读取阶段时为 `False`。
-
-### 开启映射
-
-`enable_error_mapping=True` 是默认值。内置的 `RetryTransport` 完成全部重试后：
-
-- 最终 HTTP 4xx 默认抛出 `BusinessHttpError`。
-- 最终 HTTP 5xx 默认抛出 `SystemHttpError`。
-- 最终 `httpx.RequestError` 默认抛出 `SystemHttpError`。
-- `ErrorMappingPolicy` 中第一条匹配的规则可以覆盖默认异常类型。
-
-重试策略与异常映射策略互相独立：是否重试只由 `Retry` 决定，最终抛出什么
-异常只由 `ErrorMappingPolicy` 决定。
-
-```python
-import httpx
-
-from resilient_http import (
-    BusinessHttpError,
-    ErrorMappingPolicy,
-    ErrorMappingRule,
-    HttpClient,
-    HttpClientConfig,
-    Retry,
-    SystemHttpError,
-)
-
-
-mapping = ErrorMappingPolicy(
-    rules=(
-        ErrorMappingRule(
-            name="permission-denied",
-            status_codes=frozenset({401, 403}),
-            raise_as=BusinessHttpError,
-        ),
-        ErrorMappingRule(
-            name="upstream-timeout",
-            exception_types=(httpx.ConnectTimeout, httpx.ReadTimeout),
-            raise_as=SystemHttpError,
-        ),
-    ),
-)
-
-config = HttpClientConfig(
-    base_url="https://api.example.com",
-    retry=Retry(
-        total=2,
-        status_forcelist={429, 500, 502, 503, 504},
-    ),
-    enable_error_mapping=True,
-    error_mapping=mapping,
-)
-
-with HttpClient(config) as client:
-    try:
-        client.get("/admin")
-    except BusinessHttpError as error:
-        handle_business_failure(error)
-    except SystemHttpError as error:
-        trigger_fallback_or_alert(error)
-```
-
-dict 配置的写法：
-
-```python
-config = {
-    "base_url": "https://api.example.com",
-    "retry": {
-        "total": 2,
-        "status_forcelist": [429, 500, 502, 503, 504],
+        "retry_after_max": 60,
     },
     "enable_error_mapping": True,
     "error_mapping": {
         "rules": [
             {
-                "name": "client-error",
-                "status_codes": [400, 401, 403, 404],
+                "name": "permission-denied",
+                "status_codes": [401, 403],
                 "raise_as": "business",
             },
             {
-                "name": "network-error",
+                "name": "upstream-timeout",
                 "exceptions": ["ConnectTimeout", "ReadTimeout"],
                 "raise_as": "system",
             },
@@ -273,173 +141,343 @@ config = {
         "default_system_error": "system",
     },
 }
+
+with HttpClient(config) as client:
+    try:
+        response = client.get("/users/123")
+    except BusinessHttpError as error:
+        print("request rejected:", error.status_code)
+    except SystemHttpError as error:
+        print("upstream unavailable:", error.cause)
+    else:
+        user = response.json()
 ```
 
-### 关闭映射
+`HttpClient` 应作为长生命周期对象复用，而不是为每个请求重新创建。Context
+Manager 会关闭其拥有的 Session；`close()` 可以重复调用。关闭后再次请求会抛出
+`RuntimeError`。
 
-不希望公共客户端转换最终 HTTPX 结果时，设置：
+## 使用 dataclass 配置
 
-```python
-config = HttpClientConfig(
-    retry=Retry(total=2),
-    enable_error_mapping=False,
-)
-```
-
-此时：
-
-- 最终 4xx/5xx 作为普通 `httpx.Response` 返回。
-- 最终网络错误保留原始 `httpx.RequestError`。
-- 重试仍然由内置的 `RetryTransport` 执行。
-- 通过 `HttpClient`/`AsyncHttpClient` 请求时，one-shot 请求体安全检查仍然有效。
-
-公共客户端不自行决定日志等级。APP 可以在映射开启时根据
-`BusinessHttpError`、`SystemHttpError` 或具体子类统一记录日志和告警；映射
-关闭时则按原生 HTTPX 状态码与异常处理。
-
-本客户端会清理自身异常文本里的敏感 URL 部分，但 vendored 上游代码的 DEBUG
-日志可能包含完整 request URL。生产环境不要直接开启该 logger 的 DEBUG 输出，
-或在日志管道中先过滤 token、query 和认证信息。
-
-## 自定义业务异常
-
-自定义类型必须继承 `BaseHttpError`。推荐继承 `BusinessHttpError` 或
-`SystemHttpError`，并保留父类构造器签名：
+需要 Python 对象配置时，使用公开的 frozen dataclass：
 
 ```python
 from resilient_http import (
-    ErrorMappingPolicy,
-    ErrorMappingRule,
     HttpClient,
     HttpClientConfig,
-    SystemHttpError,
+    PoolConfig,
+    RetryConfig,
+    TimeoutConfig,
 )
 
 
-class InventoryUnavailable(SystemHttpError):
-    pass
-
-
-mapping = ErrorMappingPolicy(
-    rules=(
-        ErrorMappingRule(
-            name="inventory-unavailable",
-            status_codes=frozenset({503}),
-            raise_as=InventoryUnavailable,
-        ),
+config = HttpClientConfig(
+    base_url="https://api.example.com/v1",
+    timeout=TimeoutConfig(connect=3, read=20),
+    pool=PoolConfig(connections=10, maxsize=20, block=False),
+    retry=RetryConfig(
+        total=3,
+        connect=3,
+        read=1,
+        status=2,
     ),
 )
 
-with HttpClient(
-    HttpClientConfig(
-        base_url="https://inventory.example.com",
-        retry={
-            "total": 2,
-            "status_forcelist": [503],
-        },
-        error_mapping=mapping,
-    )
-) as client:
-    client.get("/stock")
+with HttpClient(config) as client:
+    response = client.get("/health")
 ```
 
-耗尽重试后会抛出 `InventoryUnavailable`，同时仍可由
-`SystemHttpError` 或 `BaseHttpError` 捕获。JSON/YAML 配置只能使用
-`"business"`、`"system"` 等内置类型名称；自定义异常类应通过 Python 配置
-传入。
+也可以把一个显式的 `urllib3.util.Retry`（本项目同时导出为
+`resilient_http.Retry`）传给 `HttpClientConfig`。规范层会验证它，并强制
+`redirect=0`、`raise_on_redirect=False` 和 `raise_on_status=False`，确保重定向
+仍由 Requests 管理，最终响应仍可进入统一异常映射。一般业务配置优先使用
+`RetryConfig` 或 dict。自定义 `Retry` 子类不会被接受，避免规范层的 attempt
+观察逻辑静默覆盖子类自己的重试语义。
 
-## one-shot 请求体安全边界
+`retry_from_dict(mapping)` 可用于只构造一个经过规范化的 urllib3 `Retry`。
 
-`RetryTransport` 会重复发送同一个 request，但不会验证 body 是否能够重放。
-当 `total > 0` 且当前 HTTP 方法允许重试时，本客户端会在首次发送前拒绝：
+## 默认值
 
-- generator、iterator 或一次性 byte stream
-- `data` 中的一次性 iterator
-- 包含 open file/stream 的 multipart `files`
+不提供配置时使用以下默认值：
 
-这类请求会抛出 `NonReplayableRequestError`，防止首次有内容、重试时却发送
-空 body。优先使用 `bytes`、字符串、JSON 或完全位于内存中的 multipart
-内容。
+| 配置 | 默认值 |
+| --- | --- |
+| `base_url` | `""` |
+| connect/read timeout | `10.0` 秒 / `10.0` 秒 |
+| `follow_redirects` | `False` |
+| `max_redirects` | `10` |
+| `verify` | `True` |
+| `trust_env` | `True` |
+| pool connections/maxsize/block | `10` / `10` / `False` |
+| retry `total` | `0`，默认不重试 |
+| retry methods | `GET`、`HEAD`、`OPTIONS` |
+| retry statuses | `429`、`500`、`502`、`503`、`504` |
+| retry `other` | `0` |
+| backoff factor/max/jitter | `0.5` / `30.0` 秒 / `0.5` 秒 |
+| `respect_retry_after_header` | `True` |
+| `retry_after_max` | `60` 秒 |
+| `enable_error_mapping` | `True` |
 
-此检查只能识别常见的一次性对象，不能证明任意自定义 stream 一定可重放。
-业务侧仍需确保允许重试的方法、幂等键和请求体都满足重复发送要求。
+默认 Retry 方法、状态码和退避参数在 `total=0` 时不会产生重试。只设置
+`"retry": {"total": 3}` 即可启用这组组织安全默认。
 
-## Vendored 0.4.6 的 response body 限制
+`verify` 还可以是非空 CA bundle 路径。`trust_env=True` 保留 Requests 对环境
+代理、认证和证书相关配置的默认处理。
 
-vendored `httpx-retries 0.4.6` 只有 Transport 级重试。Transport 在 HTTPX 读取完整
-response body 之前已经返回，因此：
+## 重试次数和分类语义
 
-- 连接、发送以及收到响应头之前的可重试异常可以重试。
-- 可重试 HTTP 状态码可以重试。
-- 开始读取最终 response body 后才发生的 `ReadTimeout`、
-  `RemoteProtocolError` 等异常无法由 `RetryTransport` 重试。
+`total` 表示首次发送之后最多允许的重试次数：
 
-后续版本提供的 `retry_request` / `aretry_request` helper 可以覆盖部分
-read-phase 错误，但它们不支持 Python 3.9，因此本项目不使用这些 API。
+```text
+total=0  -> 最多发送 1 次
+total=2  -> 最多发送 3 次
+total=n  -> 最多发送 n + 1 次
+```
 
-## 异步客户端
+`connect`、`read`、`status` 和 `other` 是分类上限，所有分类同时受 `total`
+总上限约束：
+
+- `connect`：通常发生在远端收到请求之前，例如建连失败。
+- `read`：urllib3 在 Adapter 尚未返回时识别的读取/协议错误。
+- `status`：方法允许且状态码位于 `status_forcelist` 中的响应。
+- `other`：不能归入以上分类的错误；默认固定为 `0`，避免意外重复有副作用的请求。
+
+分类值为 `None` 时使用 `total` 的预算。urllib3 不支持为每个状态码配置不同次数；
+例如“500 重试 2 次、429 重试 5 次”不能仅通过本客户端配置表达。
+
+connect 类错误被认为发生在请求发出之前，因此可能不受 `allowed_methods` 限制。
+status/read 重试受方法集合限制。默认不对 `POST`、`PUT`、`PATCH`、`DELETE`
+进行 status/read 重试。只有远端接口确实幂等、使用了幂等键，并且请求体可以安全
+重放时，才应显式加入这些方法。
+
+`allowed_methods=[]` 不表示禁用重试：urllib3 的空集合语义容易退化为允许任意
+方法，因此本项目直接拒绝空方法集合。完全关闭重试请使用 `total=0`。
+`status_forcelist=[]` 是合法的，可用于关闭基于状态码的强制重试。
+
+## 指数退避、jitter 和 Retry-After
+
+退避完全由 urllib3 实现，指数底数固定为 2，不能单独配置。默认
+`backoff_factor=0.5` 时，连续重试的基础等待大致为：
+
+```text
+0、1、2、4、8 ... 秒
+```
+
+每次再增加 `random.uniform(0, backoff_jitter)` 秒，最后受 `backoff_max`
+限制。这里的 `backoff_jitter` 是秒数，不是比例。
+
+`respect_retry_after_header=True` 时，urllib3 会优先遵守适用状态响应中的
+`Retry-After`，但本项目默认把单次等待限制在 `retry_after_max=60` 秒。即使某个
+状态不在 `status_forcelist` 中，带有效 `Retry-After` 的 413、429 或 503 仍可能
+触发 urllib3 的重试判断。
+
+最终状态耗尽后不会由 urllib3 抛出 `RetryError`：规范层固定
+`raise_on_status=False`，取得最后一个 Response 后再执行 Business/System 映射。
+
+## 不可重放的请求体
+
+重试和 307/308 redirect 都可能使同一请求体发送多次。若当前 Retry 配置可能重新
+发送请求，或者本次请求启用了 redirect，本客户端会在发送前检查 `data=`：
+
+- `str`、`bytes`、`bytearray`、`memoryview`、mapping、list 和 tuple 视为可重放。
+- 同时支持 `tell()` 和 `seek()` 且可以回到当前位置的文件对象视为可重放。
+- generator、iterator 和不能 rewind 的 stream 会在发送前抛出
+  `NonReplayableRequestError`，此时 `attempts == 0`。
+
+完全关闭重试后不会执行这项拒绝检查。
+
+这个保护主要针对 `data=`。复杂 multipart `files=`、自定义对象以及底层
+`raw_session` 调用仍由 APP 负责保证可重放。即使方法在语义上幂等，也不代表一次性
+请求体可以安全重复发送。
+
+## Business/System 异常映射
+
+公开异常层级：
+
+```text
+BaseHttpError
+├── BusinessHttpError
+└── SystemHttpError
+    └── NonReplayableRequestError
+```
+
+默认映射发生在所有 urllib3 重试完成之后：
+
+- 最终 400–499：`BusinessHttpError`。
+- 最终 500–599：`SystemHttpError`。
+- `requests.RequestException`，例如 `ConnectionError`、`ConnectTimeout`、
+  `ReadTimeout`、`SSLError`：`SystemHttpError`。
+- 300–399 不属于错误；`follow_redirects=False` 时直接返回 3xx Response。
+
+`ErrorMappingPolicy` 中第一条匹配的规则优先，可以按最终状态码或 Requests
+异常类型选择自定义 `BaseHttpError` 子类。dict 配置中的异常名称来自
+`requests.exceptions`，`raise_as` 使用 `"business"` 或 `"system"`；Python
+dataclass 配置可以直接传入自定义异常类。
+
+映射后的异常提供：
+
+- `method`
+- 已移除用户名、密码、query 和 fragment 的 `url`
+- `attempts`
+- `status_code`
+- `rule_name`
+- `retry_exhausted`
+- `response`
+- `cause`
+
+`attempts` 包括 urllib3 内部重试和 Requests redirect 产生的实际发送。
+`retry_exhausted=True` 表示最终条件原本可以重试、至少发生过一次重试且预算已经
+耗尽；不可重试的最终条件、`total=0` 和响应头返回后的 body 读取错误不会被误标为
+耗尽。
+
+本项目不根据异常类型直接写业务日志。APP 可以捕获 `BusinessHttpError` 和
+`SystemHttpError`，自行决定使用 error、critical、告警或降级。异常消息不会包含
+query 值或响应 body；APP 记录 `response`、`cause` 时仍需执行自己的敏感信息策略。
+
+设置 `enable_error_mapping=False` 后，最终 4xx/5xx Response 会直接返回，
+Requests 网络异常会保持原类型抛出。
+
+## base_url 安全规则
+
+配置了 `base_url` 时：
+
+- 必须是带 host 的绝对 `http://` 或 `https://` URL。
+- 不允许包含用户名、密码、query 或 fragment。
+- 每次请求的 `url` 必须是相对 URL；绝对 URL 和 `//other-host/path` 会被拒绝，
+  避免调用方绕过已配置的 host。
+- 启用 redirect 后也只允许同 scheme、host 和有效端口的同源跳转；跨域跳转会在
+  第二个请求发出前被拒绝，避免自定义认证 header 被转发到另一个服务。HTTP 升级到
+  HTTPS 也属于跨源，需要 APP 直接使用最终 HTTPS URL。
+- 请求路径开头的 `/` 会被移除后再拼接，因此
+  `base_url=https://api.example.com/v1` 与 `/users` 会得到
+  `https://api.example.com/v1/users`，不会意外丢失 `/v1`。
+
+相对路径中的 `..` 仍遵循标准 URL 归一化规则，可能离开 `base_url` 的 path
+前缀；不要把未经校验的用户输入直接作为相对路径。
+
+未配置 `base_url` 时，应向客户端传入完整绝对 URL。最终异常中的 URL 会自动移除
+认证信息、query 和 fragment。
+
+## Session、raw_session 和 create_session
+
+`HttpClient` 创建并拥有一个可复用的 Requests Session，同时为 `http://` 和
+`https://` 安装带 urllib3 Retry 的 `HTTPAdapter`。
+
+`raw_session` 暴露这个底层 Session；`raw_client` 是迁移期兼容别名。直接调用
+它时仍会使用已挂载的 retry、连接池、headers、TLS、环境和 redirect limit 配置，
+但会绕过：
+
+- `HttpClient` 的默认 timeout 注入
+- `base_url` 解析和 host 限制
+- 同源 redirect 保护
+- 不可重放 body 检查
+- Business/System 异常映射
+- 统一 attempt 元数据
+
+因此业务请求应继续通过 `HttpClient.request/get/post/...`。`raw_session`
+主要用于设置 Requests 原生的 auth、cookies、proxies 或调试状态，不应作为另一套
+业务调用入口。
+
+通过 `session_factory` 注入的 Session 也由 `HttpClient` 接管并在关闭时关闭；
+factory 必须返回 `requests.Session`。若自定义 Session 覆写了 `request()`、
+`send()` 或 adapter 流程，它也可能绕过 attempt 统计和同源 redirect 保护；这个
+接缝主要用于测试或保持 Requests 标准发送链的受控扩展。
+
+`create_session(config)` 适用于明确只需要组织配置的底层 Requests Session：
 
 ```python
-from resilient_http import AsyncHttpClient
+from resilient_http import create_session
 
 
-async with AsyncHttpClient(config) as client:
-    response = await client.get("/users/123")
+session = create_session(config)
+try:
+    response = session.get(
+        "https://api.example.com/health",
+        timeout=(3, 20),
+    )
+finally:
+    session.close()
 ```
 
-同步和异步客户端使用相同的 `Retry`、dict 配置、异常映射与安全边界。
+调用方拥有 `create_session` 的返回值，并且必须显式提供 timeout。这个入口不提供
+`HttpClient` 的 base URL、同源 redirect 保护、body 安全检查或异常映射。
 
-`raw_client` 属性是高级 escape hatch。它仍使用同一个 `RetryTransport`，
-但会绕过异常映射和 one-shot 请求体检查；不要通过它发送可能重试的 stream、
-generator 或 open file，否则上游可能在后续 attempt 中发送空 body。
+## 运行边界
 
-## Transport 与未来限流
+### 同步和异步
 
-当前只实现重试和可选异常映射，不提供内置流量控制。未来可以把限流 Transport
-作为内层 Transport，再由 `RetryTransport` 包装：
+Requests 和 urllib3 Retry 都是同步阻塞的，包括退避期间的 sleep。本项目不提供
+`AsyncHttpClient`，也不应直接在 asyncio event loop 中调用。异步 APP 可以把整个
+同步调用放入受控线程池，或者继续使用独立的异步 HTTPX 客户端。
 
-```text
-HttpClient
-└── RetryTransport          唯一重试层
-    └── RateLimitTransport  每次物理发送都经过限流
-        └── HTTPTransport
-```
+### Timeout 不是总 deadline
 
-这样首次发送和每次重试都会计入限流。不要再叠加第二个重试 Transport，否则
-实际发送次数会相乘，且监控中的尝试次数会失真。
+默认 `(10.0, 10.0)` 分别是每一次物理尝试的 connect timeout 和 read timeout。
+Requests 没有这里的 write timeout、pool timeout 或涵盖全部重试与 backoff 的总
+deadline。DNS、多个地址、每次重试和每段退避都可能增加总耗时。调用方可以通过
+每次请求的 `timeout=` 覆盖默认值，但如果业务需要端到端 deadline，应在更上层实现。
 
-## 从旧 API 迁移
+### 流式读取
 
-旧版本的自研重试 API 已删除，主要映射如下：
+urllib3 Retry 发生在 `HTTPAdapter` 内部。Response headers 已返回之后的 body
+读取失败不会重新进入 Adapter：
 
-| 旧配置 | 新配置 |
-| --- | --- |
-| `retry_policy=RetryPolicy(...)` | `retry=Retry(...)` 或 flat retry dict |
-| `retry.rules` / `RetryRule` | 删除；重试条件直接配置在同一个 `Retry` 中 |
-| `max_attempts` | `total=max_attempts-1` |
-| `retry_methods` | `allowed_methods` |
-| `status_codes` | `status_forcelist` |
-| `exceptions` / `exception_types` | `retry_on_exceptions` |
-| `BackoffConfig.initial_delay` | `backoff_factor`，公式由上游 0.4.6 决定 |
-| `BackoffConfig.max_delay` | `max_backoff_wait` |
-| `BackoffConfig.jitter` | `backoff_jitter`，从加性秒数改为 `0..1` 比例 |
-| `respect_retry_after` | `respect_retry_after_header` |
-| `RetryRule.raise_as` | `ErrorMappingRule.raise_as` |
-| 默认业务/系统异常 | `ErrorMappingPolicy` 的两个 default 字段 |
+- 默认 `stream=False` 时，这类 Requests 异常仍发生在 `HttpClient.request`
+  返回前，会映射为 `SystemHttpError`，但不会自动重试。
+- `stream=True` 时，`iter_content()`、`iter_lines()` 或 `response.raw` 的异常
+  发生在客户端返回之后，不会被本项目映射或重试。
 
-迁移示例：
+使用 `stream=True` 时必须消费完 body 或关闭 Response，连接才会归还连接池。
 
-```text
-旧 max_attempts=1  → 新 total=0
-旧 max_attempts=3  → 新 total=2
-```
+### 连接池不是限流器
 
-旧规则可以为不同错误设置不同次数；新方案完全采用 0.4.6 的单一 `Retry`
-策略，因此必须选择一个统一的 `total`。异常分类不再混在重试规则中，而是
-迁移到独立、可关闭的 `ErrorMappingPolicy`。
+`PoolConfig.connections` 是 Adapter 缓存的连接池数量，`maxsize` 是每个池保留的
+连接数。默认 `block=False` 时，`maxsize` 不是并发硬上限；`block=True` 时池耗尽
+会等待，而 Requests 没有通过本配置暴露 pool acquisition timeout。
 
-旧规则中的状态码和异常如果同时影响“是否重试”与“最终异常类型”，迁移时也
-要拆成两份：分别放进 `Retry` 和 `ErrorMappingRule`。退避参数也不是数值
-原样改名：0.4.6 的第一次指数等待为 `backoff_factor * 2`，要保持旧的首次
-等待 `initial_delay`，可从 `backoff_factor=initial_delay/2` 开始评估；
-上游 multiplier 固定为 2，且有效 `Retry-After` 会替代而不是取两者较大值。
+连接池不能实现 QPS、并发或令牌桶流控。当前版本没有流量控制功能；若未来增加，
+必须明确是限制一次逻辑请求，还是包括 urllib3 内部每一次物理 retry attempt。
+
+## 从旧 HTTPX 版本迁移
+
+这个版本已经从 HTTPX/httpx-retries 架构迁移到 Requests/urllib3：
+
+- 删除 `AsyncHttpClient`；现在只有同步 `HttpClient`。
+- 删除 vendored `httpx-retries` 和私有 `_vendor` 命名空间。
+- 不再依赖 `httpx`，Response 和网络异常类型改为 Requests 类型。
+- `Retry` 现在是 `urllib3.util.Retry`，不再是 httpx-retries 的类。
+- 推荐把原来的 `Retry(...)` 配置迁移为 `RetryConfig(...)` 或 dict。
+- `retry_on_exceptions` 不再存在；改用 urllib3 的 `connect`、`read`、`status`
+  和 `other` 分类预算。
+- `max_backoff_wait` 改为 `backoff_max`。
+- `backoff_jitter` 从旧实现的比例语义变为 urllib3 的随机附加秒数。
+- timeout 只保留 Requests 支持的 connect/read；旧 write/pool timeout 不再存在。
+- `raw_client` 暂时保留为 `raw_session` 的兼容别名，新代码应使用
+  `raw_session`。
+- 测试注入从 HTTPX transport 改为返回 `requests.Session` 的
+  `session_factory`。
+
+旧代码不得继续导入 `resilient_http._vendor`，也不能把同步 Requests 客户端当作
+HTTPX AsyncClient 的无缝替代。业务 APP 应显式评估同步执行模型、异常类型和
+timeout 总耗时变化。
+
+## 公开入口
+
+稳定公开入口位于 `resilient_http`：
+
+- `HttpClient`
+- `HttpClientConfig`
+- `TimeoutConfig`
+- `PoolConfig`
+- `RetryConfig`
+- `Retry`
+- `retry_from_dict`
+- `create_session`
+- `ErrorMappingRule`
+- `ErrorMappingPolicy`
+- `BaseHttpError`
+- `BusinessHttpError`
+- `SystemHttpError`
+- `NonReplayableRequestError`
+
+业务代码不应导入以下划线开头的内部模块或类。
