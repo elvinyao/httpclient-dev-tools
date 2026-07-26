@@ -11,6 +11,9 @@
 from resilient_http import Retry, create_retry, create_session
 ```
 
+完整的参数说明、重试条件矩阵、生产用示例和常见问题，请参阅
+[详细使用指南](docs/usage.md)。
+
 没有自定义 HTTP Client、配置模型、业务异常、attempt 统计、base URL、
 redirect 限制或流量控制。可选的 Session 默认 timeout 只负责补充 Requests 调用
 参数，不实现总 deadline。
