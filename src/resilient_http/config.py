@@ -146,9 +146,7 @@ def _resolve_httpx_error_type(value: Union[str, HttpxErrorType]) -> HttpxErrorTy
             return _HTTPX_ERROR_TYPES[value]
         except KeyError as error:
             supported = ", ".join(sorted(_HTTPX_ERROR_TYPES))
-            raise ValueError(
-                f"Unknown HTTPX exception {value!r}; supported names: {supported}"
-            ) from error
+            raise ValueError(f"Unknown HTTPX exception {value!r}; supported names: {supported}") from error
 
     if not isinstance(value, type) or not issubclass(value, httpx.RequestError):
         raise TypeError("Exception types must be names or subclasses of httpx.RequestError")
@@ -163,9 +161,7 @@ def _resolve_raised_error_type(
         try:
             return _RAISED_ERROR_TYPES[value.replace("_", "").lower()]
         except KeyError as error:
-            raise ValueError(
-                f"{name} must be 'business', 'system', or a BaseHttpError subclass"
-            ) from error
+            raise ValueError(f"{name} must be 'business', 'system', or a BaseHttpError subclass") from error
 
     if not isinstance(value, type) or not issubclass(value, BaseHttpError):
         raise TypeError(f"{name} must be a subclass of BaseHttpError")
@@ -210,9 +206,7 @@ def _validate_retry_instance(retry: Retry) -> Retry:
             error_type,
             httpx.RequestError,
         ):
-            raise TypeError(
-                f"retry.retry_on_exceptions[{index}] must be a subclass of httpx.RequestError"
-            )
+            raise TypeError(f"retry.retry_on_exceptions[{index}] must be a subclass of httpx.RequestError")
     return retry
 
 
@@ -360,9 +354,7 @@ class ErrorMappingRule:
         object.__setattr__(self, "exception_types", exception_types)
 
         if not status_codes and not exception_types:
-            raise ValueError(
-                "An error-mapping rule must define status_codes and/or exception_types"
-            )
+            raise ValueError("An error-mapping rule must define status_codes and/or exception_types")
         object.__setattr__(
             self,
             "raise_as",
@@ -492,9 +484,7 @@ class ErrorMappingPolicy:
             elif isinstance(rule, Mapping):
                 rules.append(ErrorMappingRule.from_dict(rule))
             else:
-                raise TypeError(
-                    f"error_mapping.rules[{index}] must be a mapping or ErrorMappingRule"
-                )
+                raise TypeError(f"error_mapping.rules[{index}] must be a mapping or ErrorMappingRule")
 
         return cls(
             rules=tuple(rules),

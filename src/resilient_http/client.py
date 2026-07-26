@@ -149,9 +149,7 @@ def _async_retry_transport(
 def _method_can_retry(retry: Retry, method: str) -> bool:
     if retry.total <= retry.attempts_made:
         return False
-    has_retryable_status = any(
-        isinstance(code, int) and 100 <= code <= 599 for code in retry.status_forcelist
-    )
+    has_retryable_status = any(isinstance(code, int) and 100 <= code <= 599 for code in retry.status_forcelist)
     if not has_retryable_status and not retry.retryable_exceptions:
         return False
     try:
@@ -459,11 +457,7 @@ class HttpClient:
             if not self.config.enable_error_mapping:
                 raise
             rule = self.config.error_mapping.for_exception(error)
-            error_type = (
-                rule.raise_as
-                if rule is not None
-                else self.config.error_mapping.default_system_error
-            )
+            error_type = rule.raise_as if rule is not None else self.config.error_mapping.default_system_error
             _raise_failure(
                 error_type,
                 retry=self.retry,
@@ -586,11 +580,7 @@ class AsyncHttpClient:
             if not self.config.enable_error_mapping:
                 raise
             rule = self.config.error_mapping.for_exception(error)
-            error_type = (
-                rule.raise_as
-                if rule is not None
-                else self.config.error_mapping.default_system_error
-            )
+            error_type = rule.raise_as if rule is not None else self.config.error_mapping.default_system_error
             _raise_failure(
                 error_type,
                 retry=self.retry,
