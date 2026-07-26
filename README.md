@@ -27,7 +27,7 @@ uv add resilient-http-client
 ```bash
 uv sync
 uv lock --check
-uv run python -m unittest discover -s tests -v
+uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv build
@@ -43,11 +43,34 @@ uv run ruff format .
 最低 Python 版本验证：
 
 ```bash
-uv run --python 3.9 python -m unittest discover -s tests -v
+uv run --python 3.9 pytest
 ```
 
 项目支持 Python 3.9 及以上版本，并使用 uv 管理依赖和 lockfile。Requests 与
 urllib3 都是直接依赖，因为本项目直接公开并使用 `urllib3.util.Retry`。
+
+## 测试
+
+测试全部使用 pytest，并通过本地 HTTP server 或针对底层连接点的受控替身验证
+真实的 Requests/urllib3 行为，不访问公网。每个测试都有中文场景说明，明确故障、
+是否应重试以及最终异常。运行完整测试：
+
+```bash
+uv run pytest
+```
+
+测试覆盖以下类别：
+
+- 公开 API、参数校验，以及不同 Session、Adapter、连接池和关闭操作之间的隔离。
+- GET/HEAD/OPTIONS 和非幂等方法的 retry 规则，以及每个逻辑请求独立的 Retry
+  history。
+- 408、429、500、502、503、504 等可配置重试状态，非重试 4xx/5xx，
+  `Retry-After`，以及 `raise_on_status` 的两种耗尽行为。
+- DNS 解析失败、连接拒绝、proxy 连接失败、connect/read timeout、连接 reset、
+  远端提前断开、TLS 失败和响应体中途截断，包括瞬时恢复与重试耗尽。
+- Requests 原生 URL、HTTP 状态和连接异常类型，确保 factory 不包装或替换异常。
+
+pytest 配置会严格检查未知配置项和未注册 marker，避免拼写错误被静默忽略。
 
 ## 完整示例
 
