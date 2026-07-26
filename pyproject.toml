@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "resilient-http-client"
-version = "0.1.0"
-description = "An organization-level Requests client with urllib3 retries and domain exceptions."
+version = "0.2.0"
+description = "A minimal Requests Session factory with urllib3 retries."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
