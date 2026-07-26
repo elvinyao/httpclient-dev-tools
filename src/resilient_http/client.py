@@ -1,41 +1,163 @@
-"""Synchronous and asynchronous policy-driven HTTPX clients."""
+"""HTTPX clients with upstream retries and optional domain-error mapping."""
 
 from __future__ import annotations
 
-import asyncio
-import random
-import time
-from collections.abc import AsyncIterator, Awaitable, Iterator, Mapping
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from typing import (
-    Any,
-    Callable,
-    NoReturn,
-    Union,
-)
+from collections.abc import AsyncIterator, Iterator, Mapping
+from typing import Any, NoReturn, Optional, Union
 
 import httpx
+from httpx_retries import Retry, RetryTransport
 
-from .config import HttpClientConfig, RetryPolicy, RetryRule
+from .config import ErrorMappingRule, HttpClientConfig
 from .exceptions import BaseHttpError, NonReplayableRequestError
 
-Sleep = Callable[[float], None]
-AsyncSleep = Callable[[float], Awaitable[None]]
-RandomValue = Callable[[], float]
-Now = Callable[[], datetime]
 ConfigInput = Union[HttpClientConfig, Mapping[str, Any]]
+Url = Union[str, httpx.URL]
+
+_REQUEST_STATE_EXTENSION = "resilient_http.request_state"
+
+
+class _RequestState:
+    """Mutable state shared by retries and redirect requests."""
+
+    __slots__ = ("attempts", "transport_completed")
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.transport_completed = False
+
+
+def _request_state(
+    request: httpx.Request,
+    *,
+    create: bool = False,
+) -> Optional[_RequestState]:
+    state = request.extensions.get(_REQUEST_STATE_EXTENSION)
+    if isinstance(state, _RequestState):
+        return state
+    if not create:
+        return None
+
+    state = _RequestState()
+    request.extensions[_REQUEST_STATE_EXTENSION] = state
+    return state
+
+
+def _prepare_request_extensions(kwargs: dict[str, Any]) -> None:
+    raw_extensions = kwargs.get("extensions")
+    if raw_extensions is None:
+        extensions: dict[str, Any] = {}
+    elif isinstance(raw_extensions, Mapping):
+        extensions = dict(raw_extensions)
+    else:
+        raise TypeError("request extensions must be a mapping")
+
+    # Never trust or mutate caller-owned extension state.
+    extensions[_REQUEST_STATE_EXTENSION] = _RequestState()
+    kwargs["extensions"] = extensions
 
 
 def _config_from_value(config: ConfigInput) -> HttpClientConfig:
     if isinstance(config, HttpClientConfig):
         return config
-    return HttpClientConfig.from_dict(config)
+    if isinstance(config, Mapping):
+        return HttpClientConfig.from_dict(config)
+    raise TypeError("config must be an HttpClientConfig or a mapping")
 
 
-def _method_can_ever_retry(policy: RetryPolicy, method: str) -> bool:
-    normalized = method.upper()
-    return any(rule.max_attempts > 1 and normalized in rule.retry_methods for rule in policy.rules)
+def _configured_retry(config: HttpClientConfig) -> Retry:
+    retry = config.retry
+    if not isinstance(retry, Retry):  # Defensive: __post_init__ normalizes it.
+        raise TypeError("config.retry must be an httpx_retries.Retry")
+    return retry
+
+
+class _AttemptTrackingTransport(httpx.BaseTransport):
+    """Observe physical sends without making any retry decisions."""
+
+    def __init__(self, transport: httpx.BaseTransport) -> None:
+        self._transport = transport
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        state = _request_state(request, create=True)
+        assert state is not None
+        state.attempts += 1
+        state.transport_completed = False
+        response = self._transport.handle_request(request)
+        state.transport_completed = True
+        return response
+
+    def close(self) -> None:
+        self._transport.close()
+
+
+class _AsyncAttemptTrackingTransport(httpx.AsyncBaseTransport):
+    """Asynchronous physical-send observer."""
+
+    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
+        self._transport = transport
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        state = _request_state(request, create=True)
+        assert state is not None
+        state.attempts += 1
+        state.transport_completed = False
+        response = await self._transport.handle_async_request(request)
+        state.transport_completed = True
+        return response
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
+def _sync_retry_transport(
+    retry: Retry,
+    transport: Optional[httpx.BaseTransport],
+) -> RetryTransport:
+    if isinstance(transport, RetryTransport):
+        raise ValueError(
+            "transport must be the underlying transport, not RetryTransport; "
+            "this client installs exactly one httpx-retries layer"
+        )
+    if transport is not None and not isinstance(transport, httpx.BaseTransport):
+        raise TypeError("transport must be an httpx.BaseTransport")
+    inner = transport if transport is not None else httpx.HTTPTransport()
+    return RetryTransport(
+        transport=_AttemptTrackingTransport(inner),
+        retry=retry,
+    )
+
+
+def _async_retry_transport(
+    retry: Retry,
+    transport: Optional[httpx.AsyncBaseTransport],
+) -> RetryTransport:
+    if isinstance(transport, RetryTransport):
+        raise ValueError(
+            "transport must be the underlying transport, not RetryTransport; "
+            "this client installs exactly one httpx-retries layer"
+        )
+    if transport is not None and not isinstance(transport, httpx.AsyncBaseTransport):
+        raise TypeError("transport must be an httpx.AsyncBaseTransport")
+    inner = transport if transport is not None else httpx.AsyncHTTPTransport()
+    return RetryTransport(
+        transport=_AsyncAttemptTrackingTransport(inner),
+        retry=retry,
+    )
+
+
+def _method_can_retry(retry: Retry, method: str) -> bool:
+    if retry.total <= retry.attempts_made:
+        return False
+    has_retryable_status = any(
+        isinstance(code, int) and 100 <= code <= 599 for code in retry.status_forcelist
+    )
+    if not has_retryable_status and not retry.retryable_exceptions:
+        return False
+    try:
+        return retry.is_retryable_method(method)
+    except ValueError:
+        return False
 
 
 def _is_one_shot(value: Any) -> bool:
@@ -73,7 +195,7 @@ def _files_are_replayable(files: Any) -> bool:
     return True
 
 
-def _non_replayable_body_reason(kwargs: Mapping[str, Any]) -> str | None:
+def _non_replayable_body_reason(kwargs: Mapping[str, Any]) -> Optional[str]:
     content = kwargs.get("content")
     if content is not None and _is_one_shot(content):
         return "content is a one-shot iterator or stream"
@@ -90,13 +212,14 @@ def _non_replayable_body_reason(kwargs: Mapping[str, Any]) -> str | None:
 
 
 def _reject_non_replayable_body(
-    policy: RetryPolicy,
+    retry: Retry,
     method: str,
-    url: str | httpx.URL,
+    url: Url,
     kwargs: Mapping[str, Any],
 ) -> None:
-    if not _method_can_ever_retry(policy, method):
+    if not _method_can_retry(retry, method):
         return
+
     reason = _non_replayable_body_reason(kwargs)
     if reason is None:
         return
@@ -110,25 +233,7 @@ def _reject_non_replayable_body(
     )
 
 
-def _request_details(
-    fallback_method: str,
-    fallback_url: str | httpx.URL,
-    *,
-    response: httpx.Response | None = None,
-    error: Exception | None = None,
-) -> tuple[str, str]:
-    request: httpx.Request | None = None
-    if response is not None:
-        request = response.request
-    elif isinstance(error, httpx.RequestError):
-        request = error.request
-
-    if request is not None:
-        return request.method, _safe_url(request.url)
-    return fallback_method.upper(), _safe_url(fallback_url)
-
-
-def _safe_url(url: str | httpx.URL) -> str:
+def _safe_url(url: Url) -> str:
     """Remove credentials, query values, and fragments from error metadata."""
 
     try:
@@ -142,67 +247,111 @@ def _safe_url(url: str | httpx.URL) -> str:
             )
         )
     except (TypeError, ValueError, httpx.InvalidURL):
-        # The original value may itself be an invalid URL. Avoid echoing it,
-        # since it could contain credentials or query secrets.
         return "<invalid-url>"
 
 
-def _retry_after_seconds(
-    response: httpx.Response | None,
-    now: Now,
-) -> float | None:
-    if response is None:
+def _request_from_error(error: Exception) -> Optional[httpx.Request]:
+    if not isinstance(error, httpx.RequestError):
         return None
-
-    value = response.headers.get("Retry-After")
-    if value is None:
-        return None
-
-    stripped = value.strip()
-    if stripped.isdigit():
-        try:
-            return float(int(stripped))
-        except (OverflowError, ValueError):
-            # The backoff policy will cap infinity to max_delay.
-            return float("inf")
-
     try:
-        target = parsedate_to_datetime(value)
-    except (TypeError, ValueError, OverflowError):
+        return error.request
+    except RuntimeError:
         return None
 
-    if target.tzinfo is None:
-        target = target.replace(tzinfo=timezone.utc)
-    current = now()
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    return max(0.0, (target - current).total_seconds())
+
+def _request_details(
+    fallback_method: str,
+    fallback_url: Url,
+    *,
+    response: Optional[httpx.Response] = None,
+    error: Optional[Exception] = None,
+) -> tuple[str, str]:
+    request: Optional[httpx.Request] = None
+    if response is not None:
+        try:
+            request = response.request
+        except RuntimeError:
+            request = None
+    elif error is not None:
+        request = _request_from_error(error)
+
+    if request is not None:
+        return request.method, _safe_url(request.url)
+    return fallback_method.upper(), _safe_url(fallback_url)
 
 
-def _delay(
-    rule: RetryRule,
-    retry_number: int,
-    response: httpx.Response | None,
-    random_value: RandomValue,
-    now: Now,
-) -> float:
-    retry_after = _retry_after_seconds(response, now) if rule.backoff.respect_retry_after else None
-    return rule.backoff.delay_for_retry(
-        retry_number,
-        retry_after=retry_after,
-        random_value=random_value(),
-    )
+def _attempts_from_request(request: Optional[httpx.Request]) -> int:
+    if request is None:
+        return 1
+    state = _request_state(request)
+    if state is not None and state.attempts >= 1:
+        return state.attempts
+    return 1
+
+
+def _attempts_for_response(response: httpx.Response) -> int:
+    try:
+        request = response.request
+    except RuntimeError:
+        request = None
+    return _attempts_from_request(request)
+
+
+def _attempts_for_error(error: Exception) -> int:
+    return _attempts_from_request(_request_from_error(error))
+
+
+def _transport_completed_for_error(error: Exception) -> bool:
+    request = _request_from_error(error)
+    if request is None:
+        return False
+    state = _request_state(request)
+    return state is not None and state.transport_completed
+
+
+def _retry_budget_exhausted(retry: Retry, attempts: int) -> bool:
+    remaining_retries = retry.total - retry.attempts_made
+    return remaining_retries > 0 and attempts >= remaining_retries + 1
+
+
+def _status_retry_exhausted(
+    retry: Retry,
+    method: str,
+    status_code: int,
+    attempts: int,
+) -> bool:
+    if not _retry_budget_exhausted(retry, attempts):
+        return False
+    try:
+        return retry.is_retryable_method(method) and retry.is_retryable_status_code(status_code)
+    except ValueError:
+        return False
+
+
+def _exception_retry_exhausted(
+    retry: Retry,
+    method: str,
+    error: Exception,
+    attempts: int,
+) -> bool:
+    if not _retry_budget_exhausted(retry, attempts):
+        return False
+    try:
+        return retry.is_retryable_method(method) and retry.is_retryable_exception(error)
+    except ValueError:
+        return False
 
 
 def _raise_failure(
     error_type: type[BaseHttpError],
     *,
+    retry: Retry,
     fallback_method: str,
-    fallback_url: str | httpx.URL,
+    fallback_url: Url,
     attempts: int,
-    rule: RetryRule | None,
-    response: httpx.Response | None = None,
-    cause: Exception | None = None,
+    rule: Optional[ErrorMappingRule],
+    response: Optional[httpx.Response] = None,
+    cause: Optional[Exception] = None,
 ) -> NoReturn:
     method, url = _request_details(
         fallback_method,
@@ -212,13 +361,28 @@ def _raise_failure(
     )
     status_code = response.status_code if response is not None else None
     rule_name = rule.name if rule is not None else None
-    retry_exhausted = rule is not None and rule.max_attempts > 1 and method.upper() in rule.retry_methods and attempts >= rule.max_attempts
 
     if status_code is not None:
+        retry_exhausted = _status_retry_exhausted(
+            retry,
+            method,
+            status_code,
+            attempts,
+        )
         reason = f"HTTP {status_code}"
     elif cause is not None:
+        if _transport_completed_for_error(cause):
+            retry_exhausted = False
+        else:
+            retry_exhausted = _exception_retry_exhausted(
+                retry,
+                method,
+                cause,
+                attempts,
+            )
         reason = type(cause).__name__
     else:
+        retry_exhausted = False
         reason = "unknown HTTP failure"
 
     message = "{} {} failed with {} after {} attempt{}".format(
@@ -245,135 +409,117 @@ def _raise_failure(
 
 
 class HttpClient:
-    """Synchronous client that converts HTTPX failures into domain-safe errors."""
+    """Synchronous HTTPX client using ``httpx-retries`` as its retry layer."""
 
     def __init__(
         self,
         config: ConfigInput,
         *,
-        transport: httpx.BaseTransport | None = None,
-        sleep: Sleep = time.sleep,
-        random_value: RandomValue = random.random,
-        now: Now = lambda: datetime.now(timezone.utc),
+        transport: Optional[httpx.BaseTransport] = None,
     ) -> None:
         self.config = _config_from_value(config)
-        self._sleep = sleep
-        self._random_value = random_value
-        self._now = now
+        self.retry = _configured_retry(self.config)
 
         client_options: dict[str, Any] = {
             "timeout": self.config.timeout,
             "headers": self.config.headers,
             "follow_redirects": self.config.follow_redirects,
+            "transport": _sync_retry_transport(self.retry, transport),
         }
         if self.config.base_url:
             client_options["base_url"] = self.config.base_url
-        if transport is not None:
-            client_options["transport"] = transport
         self._client = httpx.Client(**client_options)
 
     @property
     def raw_client(self) -> httpx.Client:
-        """The underlying HTTPX client for advanced, non-retry configuration."""
+        """Underlying HTTPX client; mapping and replay-safety checks are bypassed."""
 
         return self._client
 
     def request(
         self,
         method: str,
-        url: str | httpx.URL,
+        url: Url,
         **kwargs: Any,
     ) -> httpx.Response:
-        attempt = 0
         normalized_method = method.upper()
-        policy = self.config.retry_policy
-        _reject_non_replayable_body(policy, normalized_method, url, kwargs)
+        _reject_non_replayable_body(
+            self.retry,
+            normalized_method,
+            url,
+            kwargs,
+        )
+        _prepare_request_extensions(kwargs)
 
-        while True:
-            attempt += 1
-            try:
-                response = self._client.request(normalized_method, url, **kwargs)
-            except httpx.RequestError as error:
-                rule = policy.for_exception(error)
-                if rule is not None and rule.can_retry(normalized_method, attempt):
-                    delay = _delay(
-                        rule,
-                        attempt,
-                        None,
-                        self._random_value,
-                        self._now,
-                    )
-                    if delay > 0:
-                        self._sleep(delay)
-                    continue
-
-                error_type = rule.raise_as if rule is not None else policy.default_system_error
-                _raise_failure(
-                    error_type,
-                    fallback_method=normalized_method,
-                    fallback_url=url,
-                    attempts=attempt,
-                    rule=rule,
-                    cause=error,
-                )
-            except httpx.InvalidURL as error:
-                _raise_failure(
-                    policy.default_system_error,
-                    fallback_method=normalized_method,
-                    fallback_url=url,
-                    attempts=attempt,
-                    rule=None,
-                    cause=error,
-                )
-
-            if not response.is_error:
-                return response
-
-            rule = policy.for_status(response.status_code)
-            if rule is not None and rule.can_retry(normalized_method, attempt):
-                try:
-                    delay = _delay(
-                        rule,
-                        attempt,
-                        response,
-                        self._random_value,
-                        self._now,
-                    )
-                finally:
-                    response.close()
-                if delay > 0:
-                    self._sleep(delay)
-                continue
-
-            if rule is not None:
-                error_type = rule.raise_as
-            elif 400 <= response.status_code < 500:
-                error_type = policy.default_business_error
-            else:
-                error_type = policy.default_system_error
-
+        try:
+            # This is intentionally the only logical request call. RetryTransport
+            # owns every physical retry, retry decision, and backoff.
+            response = self._client.request(normalized_method, url, **kwargs)
+        except httpx.RequestError as error:
+            if not self.config.enable_error_mapping:
+                raise
+            rule = self.config.error_mapping.for_exception(error)
+            error_type = (
+                rule.raise_as
+                if rule is not None
+                else self.config.error_mapping.default_system_error
+            )
             _raise_failure(
                 error_type,
+                retry=self.retry,
                 fallback_method=normalized_method,
                 fallback_url=url,
-                attempts=attempt,
+                attempts=_attempts_for_error(error),
                 rule=rule,
-                response=response,
+                cause=error,
+            )
+        except httpx.InvalidURL as error:
+            if not self.config.enable_error_mapping:
+                raise
+            _raise_failure(
+                self.config.error_mapping.default_system_error,
+                retry=self.retry,
+                fallback_method=normalized_method,
+                fallback_url=url,
+                attempts=1,
+                rule=None,
+                cause=error,
             )
 
-    def get(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+        if not response.is_error or not self.config.enable_error_mapping:
+            return response
+
+        rule = self.config.error_mapping.for_status(response.status_code)
+        if rule is not None:
+            error_type = rule.raise_as
+        elif 400 <= response.status_code < 500:
+            error_type = self.config.error_mapping.default_business_error
+        else:
+            error_type = self.config.error_mapping.default_system_error
+
+        _raise_failure(
+            error_type,
+            retry=self.retry,
+            fallback_method=normalized_method,
+            fallback_url=url,
+            attempts=_attempts_for_response(response),
+            rule=rule,
+            response=response,
+        )
+
+    def get(self, url: Url, **kwargs: Any) -> httpx.Response:
         return self.request("GET", url, **kwargs)
 
-    def post(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    def post(self, url: Url, **kwargs: Any) -> httpx.Response:
         return self.request("POST", url, **kwargs)
 
-    def put(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    def put(self, url: Url, **kwargs: Any) -> httpx.Response:
         return self.request("PUT", url, **kwargs)
 
-    def patch(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    def patch(self, url: Url, **kwargs: Any) -> httpx.Response:
         return self.request("PATCH", url, **kwargs)
 
-    def delete(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    def delete(self, url: Url, **kwargs: Any) -> httpx.Response:
         return self.request("DELETE", url, **kwargs)
 
     def close(self) -> None:
@@ -387,137 +533,120 @@ class HttpClient:
 
 
 class AsyncHttpClient:
-    """Asynchronous equivalent of :class:`HttpClient`."""
+    """Asynchronous HTTPX client using ``httpx-retries`` for retries."""
 
     def __init__(
         self,
         config: ConfigInput,
         *,
-        transport: httpx.AsyncBaseTransport | None = None,
-        sleep: AsyncSleep = asyncio.sleep,
-        random_value: RandomValue = random.random,
-        now: Now = lambda: datetime.now(timezone.utc),
+        transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
         self.config = _config_from_value(config)
-        self._sleep = sleep
-        self._random_value = random_value
-        self._now = now
+        self.retry = _configured_retry(self.config)
 
         client_options: dict[str, Any] = {
             "timeout": self.config.timeout,
             "headers": self.config.headers,
             "follow_redirects": self.config.follow_redirects,
+            "transport": _async_retry_transport(self.retry, transport),
         }
         if self.config.base_url:
             client_options["base_url"] = self.config.base_url
-        if transport is not None:
-            client_options["transport"] = transport
         self._client = httpx.AsyncClient(**client_options)
 
     @property
     def raw_client(self) -> httpx.AsyncClient:
+        """Underlying HTTPX client; mapping and replay-safety checks are bypassed."""
+
         return self._client
 
     async def request(
         self,
         method: str,
-        url: str | httpx.URL,
+        url: Url,
         **kwargs: Any,
     ) -> httpx.Response:
-        attempt = 0
         normalized_method = method.upper()
-        policy = self.config.retry_policy
-        _reject_non_replayable_body(policy, normalized_method, url, kwargs)
+        _reject_non_replayable_body(
+            self.retry,
+            normalized_method,
+            url,
+            kwargs,
+        )
+        _prepare_request_extensions(kwargs)
 
-        while True:
-            attempt += 1
-            try:
-                response = await self._client.request(
-                    normalized_method,
-                    url,
-                    **kwargs,
-                )
-            except httpx.RequestError as error:
-                rule = policy.for_exception(error)
-                if rule is not None and rule.can_retry(normalized_method, attempt):
-                    delay = _delay(
-                        rule,
-                        attempt,
-                        None,
-                        self._random_value,
-                        self._now,
-                    )
-                    if delay > 0:
-                        await self._sleep(delay)
-                    continue
-
-                error_type = rule.raise_as if rule is not None else policy.default_system_error
-                _raise_failure(
-                    error_type,
-                    fallback_method=normalized_method,
-                    fallback_url=url,
-                    attempts=attempt,
-                    rule=rule,
-                    cause=error,
-                )
-            except httpx.InvalidURL as error:
-                _raise_failure(
-                    policy.default_system_error,
-                    fallback_method=normalized_method,
-                    fallback_url=url,
-                    attempts=attempt,
-                    rule=None,
-                    cause=error,
-                )
-
-            if not response.is_error:
-                return response
-
-            rule = policy.for_status(response.status_code)
-            if rule is not None and rule.can_retry(normalized_method, attempt):
-                try:
-                    delay = _delay(
-                        rule,
-                        attempt,
-                        response,
-                        self._random_value,
-                        self._now,
-                    )
-                finally:
-                    await response.aclose()
-                if delay > 0:
-                    await self._sleep(delay)
-                continue
-
-            if rule is not None:
-                error_type = rule.raise_as
-            elif 400 <= response.status_code < 500:
-                error_type = policy.default_business_error
-            else:
-                error_type = policy.default_system_error
-
+        try:
+            # RetryTransport owns all physical asynchronous attempts.
+            response = await self._client.request(
+                normalized_method,
+                url,
+                **kwargs,
+            )
+        except httpx.RequestError as error:
+            if not self.config.enable_error_mapping:
+                raise
+            rule = self.config.error_mapping.for_exception(error)
+            error_type = (
+                rule.raise_as
+                if rule is not None
+                else self.config.error_mapping.default_system_error
+            )
             _raise_failure(
                 error_type,
+                retry=self.retry,
                 fallback_method=normalized_method,
                 fallback_url=url,
-                attempts=attempt,
+                attempts=_attempts_for_error(error),
                 rule=rule,
-                response=response,
+                cause=error,
+            )
+        except httpx.InvalidURL as error:
+            if not self.config.enable_error_mapping:
+                raise
+            _raise_failure(
+                self.config.error_mapping.default_system_error,
+                retry=self.retry,
+                fallback_method=normalized_method,
+                fallback_url=url,
+                attempts=1,
+                rule=None,
+                cause=error,
             )
 
-    async def get(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+        if not response.is_error or not self.config.enable_error_mapping:
+            return response
+
+        rule = self.config.error_mapping.for_status(response.status_code)
+        if rule is not None:
+            error_type = rule.raise_as
+        elif 400 <= response.status_code < 500:
+            error_type = self.config.error_mapping.default_business_error
+        else:
+            error_type = self.config.error_mapping.default_system_error
+
+        _raise_failure(
+            error_type,
+            retry=self.retry,
+            fallback_method=normalized_method,
+            fallback_url=url,
+            attempts=_attempts_for_response(response),
+            rule=rule,
+            response=response,
+        )
+
+    async def get(self, url: Url, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)
 
-    async def post(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    async def post(self, url: Url, **kwargs: Any) -> httpx.Response:
         return await self.request("POST", url, **kwargs)
 
-    async def put(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    async def put(self, url: Url, **kwargs: Any) -> httpx.Response:
         return await self.request("PUT", url, **kwargs)
 
-    async def patch(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    async def patch(self, url: Url, **kwargs: Any) -> httpx.Response:
         return await self.request("PATCH", url, **kwargs)
 
-    async def delete(self, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    async def delete(self, url: Url, **kwargs: Any) -> httpx.Response:
         return await self.request("DELETE", url, **kwargs)
 
     async def aclose(self) -> None:

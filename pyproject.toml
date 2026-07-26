@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "resilient-http-client"
 version = "0.1.0"
-description = "A policy-driven HTTPX client with configurable retries and domain-friendly exceptions."
+description = "An HTTPX client with httpx-retries and optional domain-friendly exceptions."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "httpx>=0.25,<1",
+    "httpx-retries==0.4.6",
 ]
 
 [dependency-groups]
@@ -25,7 +26,7 @@ resilient_http = ["py.typed"]
 
 [tool.ruff]
 target-version = "py39"
-line-length = 200
+line-length = 100
 src = ["src", "tests"]
 extend-exclude = [
     ".venv",
@@ -45,6 +46,12 @@ select = [
     "SIM",
     "UP",
     "W",
+]
+ignore = [
+    # Keep public annotations introspectable on Python 3.9. PEP 604 unions
+    # parse with postponed annotations but fail when get_type_hints evaluates them.
+    "UP007",
+    "UP045",
 ]
 fixable = ["ALL"]
 

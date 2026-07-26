@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import httpx
 
 
@@ -19,11 +21,11 @@ class BaseHttpError(Exception):
         method: str,
         url: str,
         attempts: int,
-        rule_name: str | None = None,
-        status_code: int | None = None,
+        rule_name: Optional[str] = None,
+        status_code: Optional[int] = None,
         retry_exhausted: bool = False,
-        response: httpx.Response | None = None,
-        cause: Exception | None = None,
+        response: Optional[httpx.Response] = None,
+        cause: Optional[Exception] = None,
     ) -> None:
         super().__init__(message)
         self.method = method

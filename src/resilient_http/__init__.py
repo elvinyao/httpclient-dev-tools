@@ -1,12 +1,13 @@
 """Public API for the resilient HTTP client."""
 
+from httpx_retries import Retry
+
 from .client import AsyncHttpClient, HttpClient
 from .config import (
-    DEFAULT_RETRY_METHODS,
-    BackoffConfig,
+    ErrorMappingPolicy,
+    ErrorMappingRule,
     HttpClientConfig,
-    RetryPolicy,
-    RetryRule,
+    retry_from_dict,
 )
 from .exceptions import (
     BaseHttpError,
@@ -16,15 +17,15 @@ from .exceptions import (
 )
 
 __all__ = [
-    "DEFAULT_RETRY_METHODS",
     "AsyncHttpClient",
-    "BackoffConfig",
     "BaseHttpError",
     "BusinessHttpError",
+    "ErrorMappingPolicy",
+    "ErrorMappingRule",
     "HttpClient",
     "HttpClientConfig",
     "NonReplayableRequestError",
-    "RetryPolicy",
-    "RetryRule",
+    "Retry",
     "SystemHttpError",
+    "retry_from_dict",
 ]
