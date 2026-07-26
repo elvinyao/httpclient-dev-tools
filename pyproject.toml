@@ -26,7 +26,7 @@ resilient_http = ["py.typed"]
 
 [tool.ruff]
 target-version = "py39"
-line-length = 100
+line-length = 120
 src = ["src", "tests"]
 extend-exclude = [
     ".venv",
