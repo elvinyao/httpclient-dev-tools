@@ -1,7 +1,6 @@
 """Public API for the resilient HTTP client."""
 
-from httpx_retries import Retry
-
+from ._vendor.httpx_retries import Retry
 from .client import AsyncHttpClient, HttpClient
 from .config import (
     ErrorMappingPolicy,

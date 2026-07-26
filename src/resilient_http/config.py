@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 import httpx
-from httpx_retries import Retry
 
+from ._vendor.httpx_retries import Retry
 from .exceptions import BaseHttpError, BusinessHttpError, SystemHttpError
 
 HttpxErrorType = type[httpx.RequestError]
@@ -217,7 +217,7 @@ def _validate_retry_instance(retry: Retry) -> Retry:
 
 
 def retry_from_dict(data: Mapping[str, Any]) -> Retry:
-    """Build the Python 3.9-compatible ``httpx_retries.Retry`` configuration."""
+    """Build the Python 3.9-compatible vendored ``Retry`` configuration."""
 
     if not isinstance(data, Mapping):
         raise TypeError("retry must be a mapping")
@@ -323,7 +323,7 @@ def _retry_from_value(value: RetryInput) -> Retry:
         return _validate_retry_instance(value)
     if isinstance(value, Mapping):
         return retry_from_dict(value)
-    raise TypeError("retry must be an httpx_retries.Retry or a mapping")
+    raise TypeError("retry must be a resilient_http.Retry or a mapping")
 
 
 @dataclass(frozen=True)
@@ -633,7 +633,7 @@ class HttpClientConfig:
             raise TypeError("HTTP client configuration must be a mapping")
         if "retry_policy" in data:
             raise ValueError(
-                "retry_policy was removed; configure httpx-retries under retry "
+                "retry_policy was removed; configure the vendored Retry under retry "
                 "and terminal exception mapping under error_mapping"
             )
 

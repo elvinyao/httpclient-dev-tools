@@ -6,8 +6,8 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Any, NoReturn, Optional, Union
 
 import httpx
-from httpx_retries import Retry, RetryTransport
 
+from ._vendor.httpx_retries import Retry, RetryTransport
 from .config import ErrorMappingRule, HttpClientConfig
 from .exceptions import BaseHttpError, NonReplayableRequestError
 
@@ -68,7 +68,7 @@ def _config_from_value(config: ConfigInput) -> HttpClientConfig:
 def _configured_retry(config: HttpClientConfig) -> Retry:
     retry = config.retry
     if not isinstance(retry, Retry):  # Defensive: __post_init__ normalizes it.
-        raise TypeError("config.retry must be an httpx_retries.Retry")
+        raise TypeError("config.retry must be a resilient_http.Retry")
     return retry
 
 
@@ -117,7 +117,7 @@ def _sync_retry_transport(
     if isinstance(transport, RetryTransport):
         raise ValueError(
             "transport must be the underlying transport, not RetryTransport; "
-            "this client installs exactly one httpx-retries layer"
+            "this client installs exactly one vendored retry layer"
         )
     if transport is not None and not isinstance(transport, httpx.BaseTransport):
         raise TypeError("transport must be an httpx.BaseTransport")
@@ -135,7 +135,7 @@ def _async_retry_transport(
     if isinstance(transport, RetryTransport):
         raise ValueError(
             "transport must be the underlying transport, not RetryTransport; "
-            "this client installs exactly one httpx-retries layer"
+            "this client installs exactly one vendored retry layer"
         )
     if transport is not None and not isinstance(transport, httpx.AsyncBaseTransport):
         raise TypeError("transport must be an httpx.AsyncBaseTransport")
@@ -409,7 +409,7 @@ def _raise_failure(
 
 
 class HttpClient:
-    """Synchronous HTTPX client using ``httpx-retries`` as its retry layer."""
+    """Synchronous HTTPX client using the vendored retry transport."""
 
     def __init__(
         self,
@@ -533,7 +533,7 @@ class HttpClient:
 
 
 class AsyncHttpClient:
-    """Asynchronous HTTPX client using ``httpx-retries`` for retries."""
+    """Asynchronous HTTPX client using the vendored retry transport."""
 
     def __init__(
         self,

@@ -5,7 +5,6 @@ from typing import get_type_hints
 from unittest.mock import patch
 
 import httpx
-from httpx_retries import Retry, RetryTransport
 
 import resilient_http
 from resilient_http import (
@@ -17,8 +16,10 @@ from resilient_http import (
     HttpClient,
     HttpClientConfig,
     NonReplayableRequestError,
+    Retry,
     SystemHttpError,
 )
+from resilient_http._vendor.httpx_retries import RetryTransport
 
 
 class UpstreamUnavailable(SystemHttpError):
@@ -283,7 +284,7 @@ class HttpClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.attempts, 2)
         self.assertTrue(caught.exception.retry_exhausted)
 
-    @patch("httpx_retries.retry.time.sleep")
+    @patch("resilient_http._vendor.httpx_retries.retry.time.sleep")
     def test_retry_after_wait_is_delegated_to_httpx_retries(
         self,
         upstream_sleep,

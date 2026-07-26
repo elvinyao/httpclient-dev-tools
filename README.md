@@ -3,7 +3,7 @@
 一个面向多个 Python APP 的轻量 HTTP 客户端：
 
 - HTTP 发送、连接池由 HTTPX 负责。
-- 所有重试均由固定版本 `httpx-retries==0.4.6` 的 `RetryTransport` 负责，本项目不再实现重试循环。
+- 所有重试均由内置的 `httpx-retries 0.4.6` 源码快照负责，本项目不再实现重试循环。
 - 可选的异常映射层将最终失败转换为业务系统可处理的异常。
 - 同时提供同步 `HttpClient` 和异步 `AsyncHttpClient`。
 - 支持 Python 3.9。
@@ -31,8 +31,24 @@ uv run ruff check . --fix
 uv run ruff format .
 ```
 
-依赖统一通过 `uv add`/`uv remove` 管理，并提交更新后的 `uv.lock`。项目固定
-`httpx-retries==0.4.6`，因为这是最后一个支持 Python 3.9 的版本。
+依赖统一通过 `uv add`/`uv remove` 管理，并提交更新后的 `uv.lock`。业务 APP
+只需要依赖本项目，不需要再安装单独的 `httpx-retries` distribution；HTTPX
+仍是正常的运行时依赖。
+
+## Vendored httpx-retries
+
+项目在私有命名空间 `resilient_http._vendor.httpx_retries` 中内置上游
+`httpx-retries 0.4.6`，因为这是最后一个支持 Python 3.9 的版本。业务代码
+不得直接导入 `_vendor`；稳定入口是 `from resilient_http import Retry`。
+
+vendored Python 源码保持上游原样，来源、版本、commit、更新流程和 MIT
+许可证保存在：
+
+- `src/resilient_http/_vendor/httpx_retries/VENDORED.md`
+- `src/resilient_http/_vendor/httpx_retries/LICENSE`
+
+构建出的 wheel 不会提供顶层 `httpx_retries` 包，避免和业务 APP 的其他依赖
+发生同名覆盖。
 
 ## 重试次数的语义
 
@@ -49,13 +65,12 @@ Retry(total=n)  = 最多重试 n 次，最多发送 n + 1 次
 
 ## 直接传入 Retry
 
-需要 Python 对象配置时，可以直接使用 `httpx_retries.Retry`：
+需要 Python 对象配置时，使用本项目公开的 `Retry`：
 
 ```python
 import httpx
-from httpx_retries import Retry
 
-from resilient_http import HttpClient, HttpClientConfig
+from resilient_http import HttpClient, HttpClientConfig, Retry
 
 
 retry = Retry(
@@ -173,7 +188,7 @@ BaseHttpError
 
 ### 开启映射
 
-`enable_error_mapping=True` 是默认值。`httpx-retries` 完成全部重试后：
+`enable_error_mapping=True` 是默认值。内置的 `RetryTransport` 完成全部重试后：
 
 - 最终 HTTP 4xx 默认抛出 `BusinessHttpError`。
 - 最终 HTTP 5xx 默认抛出 `SystemHttpError`。
@@ -185,7 +200,6 @@ BaseHttpError
 
 ```python
 import httpx
-from httpx_retries import Retry
 
 from resilient_http import (
     BusinessHttpError,
@@ -193,6 +207,7 @@ from resilient_http import (
     ErrorMappingRule,
     HttpClient,
     HttpClientConfig,
+    Retry,
     SystemHttpError,
 )
 
@@ -275,16 +290,16 @@ config = HttpClientConfig(
 
 - 最终 4xx/5xx 作为普通 `httpx.Response` 返回。
 - 最终网络错误保留原始 `httpx.RequestError`。
-- 重试仍然由 `httpx-retries` 执行。
+- 重试仍然由内置的 `RetryTransport` 执行。
 - 通过 `HttpClient`/`AsyncHttpClient` 请求时，one-shot 请求体安全检查仍然有效。
 
 公共客户端不自行决定日志等级。APP 可以在映射开启时根据
 `BusinessHttpError`、`SystemHttpError` 或具体子类统一记录日志和告警；映射
 关闭时则按原生 HTTPX 状态码与异常处理。
 
-本客户端会清理自身异常文本里的敏感 URL 部分，但上游 `httpx-retries` 的
-DEBUG 日志可能包含完整 request URL。生产环境不要直接开启该 logger 的 DEBUG
-输出，或在日志管道中先过滤 token、query 和认证信息。
+本客户端会清理自身异常文本里的敏感 URL 部分，但 vendored 上游代码的 DEBUG
+日志可能包含完整 request URL。生产环境不要直接开启该 logger 的 DEBUG 输出，
+或在日志管道中先过滤 token、query 和认证信息。
 
 ## 自定义业务异常
 
@@ -349,9 +364,9 @@ with HttpClient(
 此检查只能识别常见的一次性对象，不能证明任意自定义 stream 一定可重放。
 业务侧仍需确保允许重试的方法、幂等键和请求体都满足重复发送要求。
 
-## 0.4.6 的 response body 限制
+## Vendored 0.4.6 的 response body 限制
 
-`httpx-retries==0.4.6` 只有 Transport 级重试。Transport 在 HTTPX 读取完整
+vendored `httpx-retries 0.4.6` 只有 Transport 级重试。Transport 在 HTTPX 读取完整
 response body 之前已经返回，因此：
 
 - 连接、发送以及收到响应头之前的可重试异常可以重试。
