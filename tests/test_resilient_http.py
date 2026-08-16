@@ -384,6 +384,16 @@ def test_create_retry_accepts_every_supported_policy_override() -> None:
     assert retry.respect_retry_after_header is True
 
 
+def test_create_retry_accepts_none_status_forcelist() -> None:
+    """场景：APP 传入 status_forcelist=None；预期：原生 Retry 接受 None 并禁用状态码强制重试。"""
+
+    retry = create_retry(status_forcelist=None)
+
+    assert type(retry) is Retry
+    # urllib3 原生将 status_forcelist=None 规范化为空 set()
+    assert retry.status_forcelist == set()
+
+
 def test_each_create_retry_call_returns_independent_native_retry() -> None:
     """场景：连续调用默认 factory；预期：每次返回独立的原生 Retry，且任何请求 history 均不被共享。"""
 
@@ -478,6 +488,30 @@ def test_explicit_none_disables_configured_timeout_for_one_request(style: str) -
 
     assert response.status_code == 200
     assert recorder.timeouts == [None]
+
+
+@pytest.mark.parametrize(
+    ("default_timeout", "expected"),
+    [
+        ((3.0, None), (3.0, None)),
+        ((None, 5.0), (None, 5.0)),
+        ((None, None), (None, None)),
+    ],
+    ids=["connect-only", "read-only", "both-none"],
+)
+def test_configured_default_timeout_supports_partial_none_tuple(
+    default_timeout: tuple[Optional[float], Optional[float]],
+    expected: tuple[Optional[float], Optional[float]],
+) -> None:
+    """场景：Session 配置包含 None 的 timeout tuple；预期：正确保留并传递给 Adapter。"""
+
+    with create_session(Retry(total=0), timeout=default_timeout) as session:
+        session.trust_env = False
+        recorder = mount_timeout_recorder(session)
+        response = session.get("http://timeout.test/resource")
+
+    assert response.status_code == 200
+    assert recorder.timeouts == [expected]
 
 
 def test_timeout_session_request_preserves_positional_params_argument() -> None:

@@ -12,7 +12,7 @@ from urllib3.util import Retry
 _DEFAULT_ALLOWED_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_STATUS_FORCELIST = frozenset({429, 500, 502, 503, 504})
 _TIMEOUT_UNSET = object()
-_Timeout = Union[float, tuple[float, float]]
+_Timeout = Union[float, tuple[Optional[float], Optional[float]]]
 
 
 class _TimeoutSession(requests.Session):
@@ -79,7 +79,7 @@ def create_retry(
     status: Optional[int] = None,
     other: Optional[int] = 0,
     allowed_methods: Optional[Collection[str]] = _DEFAULT_ALLOWED_METHODS,
-    status_forcelist: Collection[int] = _DEFAULT_STATUS_FORCELIST,
+    status_forcelist: Optional[Collection[int]] = _DEFAULT_STATUS_FORCELIST,
     backoff_factor: float = 0.5,
     raise_on_status: bool = False,
 ) -> Retry:
@@ -103,7 +103,7 @@ def create_retry(
 def create_session(
     retry: Retry,
     *,
-    timeout: Optional[Union[float, tuple[float, float]]] = None,
+    timeout: Optional[Union[float, tuple[Optional[float], Optional[float]]]] = None,
 ) -> requests.Session:
     """Return a new Session with retries and an optional default timeout."""
 

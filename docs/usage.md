@@ -288,7 +288,7 @@ with create_session(retry, timeout=(3, 20)) as session:
 def create_session(
     retry: Retry,
     *,
-    timeout: Optional[Union[float, tuple[float, float]]] = None,
+    timeout: Optional[Union[float, tuple[Optional[float], Optional[float]]]] = None,
 ) -> requests.Session: ...
 ```
 
