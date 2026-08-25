@@ -1,7 +1,11 @@
-# Resilient HTTP Client 详细使用指南
+# Requests 后端详细使用指南
 
-本文面向在业务 APP 中使用 `resilient-http-client` 的开发者，说明 0.3.0
-版本的配置方式、实际重试语义、timeout、异常处理和生产环境注意事项。
+本文面向使用 `resilient-http-client` Requests 后端的开发者，说明 0.4.0 版本的
+配置方式、实际重试语义、timeout、异常处理和生产环境注意事项。
+
+其他后端请参阅 [HTTPX 使用指南](httpx.md)、[aiohttp 使用指南](aiohttp.md)和
+[三个后端对比](comparison.md)。根包继续只公开 Requests API，因此从 0.3.x 升级
+不会因为安装 HTTPX 或 aiohttp extra 而改变原有 import。
 
 ## 1. 这个库负责什么
 
@@ -16,8 +20,10 @@ from resilient_http import Retry, create_retry, create_session
 - `create_session()`：创建新的 `requests.Session`，为 HTTP 和 HTTPS 挂载 Retry，
   并可选择配置 Session 默认 timeout。
 
-这个库不负责 base URL、业务异常、日志、限流、总 deadline、异步请求或逐状态码的
-不同重试次数。这些能力应由业务客户端或其他独立组件提供。
+Requests 后端不负责 base URL、业务异常、日志、限流、总 deadline 或逐状态码的
+不同重试次数。这些能力应由业务客户端或其他独立组件提供。asyncio APP 可以选择
+本项目的 HTTPX 或 aiohttp 后端，但它们保留各自底层库的行为，并不与 Requests
+完全相同。
 
 ## 2. 安装
 
@@ -650,10 +656,11 @@ read timeout 针对每次 attempt 的读取等待，不是所有 attempts、退�
 
 urllib3 Retry 不直接支持逐状态码次数。需要时应由业务层实现明确状态机。
 
-### 可以在 asyncio 中直接调用吗？
+### 可以在 asyncio 中直接调用 Requests 后端吗？
 
 不建议。Requests、urllib3 retry 和 backoff sleep 都是同步阻塞的。异步 APP 应
-使用线程隔离，或选择原生异步 HTTP 客户端。
+选择 [HTTPX AsyncClient](httpx.md) 或 [aiohttp](aiohttp.md) 后端；只有在无法迁移
+Requests 调用时才考虑把整个同步调用放入工作线程。
 
 ### 这个库有流量控制或熔断吗？
 

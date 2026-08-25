@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "resilient-http-client"
-version = "0.3.0"
-description = "A minimal Requests Session factory with retry and default timeout helpers."
+version = "0.4.0"
+description = "Minimal retry client factories for Requests, HTTPX, and aiohttp."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -13,8 +13,25 @@ dependencies = [
     "urllib3>=2.6.3,<3",
 ]
 
+[project.optional-dependencies]
+httpx = [
+    "httpx>=0.28.1,<1",
+    "httpx-retries>=0.4.6,<0.5",
+]
+aiohttp = [
+    "aiohttp>=3.13.5,<3.14",
+]
+all = [
+    "aiohttp>=3.13.5,<3.14",
+    "httpx>=0.28.1,<1",
+    "httpx-retries>=0.4.6,<0.5",
+]
+
 [dependency-groups]
 dev = [
+    "aiohttp>=3.13.5,<3.14",
+    "httpx>=0.28.1,<1",
+    "httpx-retries>=0.4.6,<0.5",
     "pytest>=8.3,<9",
     "ruff>=0.8,<1",
 ]
