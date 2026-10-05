@@ -664,3 +664,43 @@ def test_response_body_failure_after_headers_is_not_retried(
         client.get("http://body.test/resource")
 
     assert transport.calls == 1
+
+
+def test_create_retry_rejects_bare_string_allowed_methods() -> None:
+    """场景：create_retry 传入单字符串 allowed_methods；预期：立即抛 TypeError。"""
+
+    with pytest.raises(TypeError, match="must be a collection of method names, not a single string"):
+        create_retry(allowed_methods="GET")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("factory", [create_client, create_async_client], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [True, False, "10", [1, 2]],
+    ids=["bool-true", "bool-false", "string", "list"],
+)
+def test_client_factories_reject_invalid_timeout_shapes(
+    factory: Callable[..., Any],
+    invalid_timeout: Any,
+) -> None:
+    """场景：factory 传入非法 timeout 类型；预期：立即抛 TypeError。"""
+
+    with pytest.raises(TypeError, match="timeout"):
+        factory(create_retry(total=0), timeout=invalid_timeout)
+
+
+@pytest.mark.parametrize("factory", [create_client, create_async_client], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [0, -1, float("nan"), float("inf"), (0, 1), (1, 0), (1, 2, -1)],
+    ids=["zero", "negative", "nan", "inf", "zero-connect", "zero-read", "negative-write"],
+)
+def test_client_factories_reject_invalid_timeout_values(
+    factory: Callable[..., Any],
+    invalid_timeout: Any,
+) -> None:
+    """场景：factory 传入 <= 0 或非有限的数字；预期：立即抛 ValueError。"""
+
+    with pytest.raises(ValueError, match="finite and greater than 0"):
+        factory(create_retry(total=0), timeout=invalid_timeout)
+

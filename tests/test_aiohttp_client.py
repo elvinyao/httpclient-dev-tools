@@ -641,3 +641,19 @@ def test_response_body_failure_after_headers_is_not_retried() -> None:
             assert server.requests == 1
 
     run(scenario())
+
+
+def test_empty_retry_after_header_does_not_trigger_retry() -> None:
+    """场景：响应包含空 Retry-After header 且状态为非 forcelist 418；预期：不触发基于 Retry-After 的额外重试。"""
+
+    async def scenario() -> None:
+        async with ScriptedServer([ResponseSpec(418, headers={"Retry-After": ""})]) as server:
+            retry = create_retry(total=2, backoff_factor=0)
+            async with aiohttp_client.create_session(retry, timeout=1) as session:
+                async with session.get(server.url) as response:
+                    assert response.status == 418
+
+            assert len(server.requests) == 1
+
+    run(scenario())
+

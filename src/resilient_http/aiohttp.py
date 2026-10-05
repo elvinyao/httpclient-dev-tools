@@ -1,9 +1,14 @@
-"""Create native aiohttp sessions configured with urllib3 retry policies."""
+"""aiohttp backend: native ``aiohttp.ClientSession`` with urllib3 retry policies.
+
+Requires the ``aiohttp`` extra. Retries run in a client middleware that reuses
+``urllib3.util.Retry`` for budgets, backoff and ``Retry-After`` while sleeping
+with ``asyncio.sleep``. Callers always receive native aiohttp responses and the
+original aiohttp exceptions.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Optional, Union, cast
@@ -12,6 +17,7 @@ import aiohttp
 from urllib3.exceptions import ConnectTimeoutError, HTTPError, MaxRetryError, ProtocolError
 from urllib3.util import Retry
 
+from ._timeout import validate_timeout_value
 from .client import create_retry
 
 _TimeoutPair = tuple[Optional[float], Optional[float]]
@@ -174,7 +180,7 @@ class _RetryMiddleware:
             if not retry.is_retry(
                 request.method,
                 response.status,
-                has_retry_after="Retry-After" in response.headers,
+                has_retry_after=bool(response.headers.get("Retry-After")),
             ):
                 return response
 
@@ -197,24 +203,6 @@ class _RetryMiddleware:
             retry = next_retry
 
 
-def _validate_timeout_value(value: object, *, name: str) -> Optional[float]:
-    """Return one normalized positive finite Requests-style timeout value."""
-
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{name} must be a number or None")
-
-    try:
-        normalized = float(value)
-    except (OverflowError, ValueError) as error:
-        raise ValueError(f"{name} must be finite and greater than 0") from error
-
-    if not math.isfinite(normalized) or normalized <= 0:
-        raise ValueError(f"{name} must be finite and greater than 0")
-    return normalized
-
-
 def _create_timeout(timeout: Optional[_Timeout]) -> aiohttp.ClientTimeout:
     """Translate the Requests-style timeout helper to aiohttp settings."""
 
@@ -231,8 +219,8 @@ def _create_timeout(timeout: Optional[_Timeout]) -> aiohttp.ClientTimeout:
         if len(timeout) != 2:
             raise TypeError("timeout tuple must contain (connect, read)")
         connect, read = timeout
-        connect = _validate_timeout_value(connect, name="connect timeout")
-        read = _validate_timeout_value(read, name="read timeout")
+        connect = validate_timeout_value(connect, name="connect timeout")
+        read = validate_timeout_value(read, name="read timeout")
         return aiohttp.ClientTimeout(
             total=None,
             connect=connect,
@@ -244,7 +232,7 @@ def _create_timeout(timeout: Optional[_Timeout]) -> aiohttp.ClientTimeout:
         raise TypeError("timeout must be a number, (connect, read) tuple, ClientTimeout, or None")
 
     if isinstance(timeout, (int, float)):
-        value = _validate_timeout_value(timeout, name="timeout")
+        value = validate_timeout_value(timeout, name="timeout")
         assert value is not None
         return aiohttp.ClientTimeout(
             total=None,
@@ -277,11 +265,31 @@ def create_session(
     *,
     timeout: Optional[_Timeout] = None,
 ) -> aiohttp.ClientSession:
-    """Return a native aiohttp ClientSession with async urllib3 retries.
+    """Return a native ``aiohttp.ClientSession`` with async urllib3 retries.
 
     The factory must be called while an event loop is running, just like the
     native ``aiohttp.ClientSession`` constructor. Each call owns an independent
     connector and connection pool.
+
+    Args:
+        retry: The ``urllib3.util.Retry`` policy, typically from
+            :func:`create_retry`.
+        timeout: Optional default timeout. Accepts a number, a ``(connect, read)``
+            tuple, or a native ``aiohttp.ClientTimeout``. Numbers and tuples set
+            ``total=None`` so that no hidden overall deadline is imposed,
+            matching Requests. Pass native ``aiohttp.ClientTimeout(total=...)``
+            if a strict cumulative deadline is desired. ``None`` (the default)
+            disables aiohttp's 5-minute default timeout.
+
+    Returns:
+        A native ``aiohttp.ClientSession``.
+
+    Raises:
+        TypeError: If ``retry`` is not a ``urllib3.util.Retry``, or ``timeout``
+            has an unsupported type or tuple length.
+        ValueError: If a timeout number is zero, negative, NaN, or infinite.
+        RuntimeError: If the installed aiohttp version no longer supports the
+            internal connection retry switch required to enforce exact budgets.
     """
 
     if not isinstance(retry, Retry):

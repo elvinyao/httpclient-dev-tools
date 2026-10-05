@@ -1305,3 +1305,64 @@ def test_redirect_loop_uses_requests_native_too_many_redirects(
 
     # 首次响应加两次 Requests 层 redirect，第三个 302 触发上限。
     assert request_methods(server) == ["GET", "GET", "GET"]
+
+
+def test_timeout_session_pickle_roundtrip() -> None:
+    """场景：_TimeoutSession 被序列化并反序列化；预期：保持 _default_timeout 且仍能正常发请求。"""
+
+    import pickle
+
+    session = create_session(Retry(total=0), timeout=(1.5, 3.5))
+    pickled = pickle.dumps(session)
+    restored = pickle.loads(pickled)
+
+    assert getattr(restored, "_default_timeout", None) == (1.5, 3.5)
+    recorder = mount_timeout_recorder(restored)
+    response = issue_timeout_probe(restored, "get")
+    assert response.status_code == 200
+    assert recorder.timeouts == [(1.5, 3.5)]
+
+
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [True, False, "5", (1, 2, 3), (1,), [1, 2]],
+    ids=["bool-true", "bool-false", "string", "3-tuple", "1-tuple", "list"],
+)
+def test_create_session_rejects_invalid_timeout_shapes(invalid_timeout: Any) -> None:
+    """场景：create_session 传入不支持的 timeout 类型或 tuple 长度；预期：立即抛 TypeError。"""
+
+    with pytest.raises(TypeError, match="timeout"):
+        create_session(Retry(total=0), timeout=invalid_timeout)
+
+
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [0, -1, float("nan"), float("inf"), (0, 1), (1, 0), (-1, 2)],
+    ids=["zero", "negative", "nan", "inf", "zero-connect", "zero-read", "negative-connect"],
+)
+def test_create_session_rejects_invalid_timeout_values(invalid_timeout: Any) -> None:
+    """场景：create_session 传入小于等于 0 或非有限的数字；预期：立即抛 ValueError。"""
+
+    with pytest.raises(ValueError, match="finite and greater than 0"):
+        create_session(Retry(total=0), timeout=invalid_timeout)
+
+
+def test_create_retry_normalizes_methods_and_rejects_empty_or_string() -> None:
+    """场景：create_retry 处理 allowed_methods；预期：大小写规范化、拒绝单字符串与空集合、支持 None。"""
+
+    # 大小写规范化为大写
+    retry = create_retry(allowed_methods=["get", "options"])
+    assert retry.allowed_methods == frozenset({"GET", "OPTIONS"})
+
+    # None 允许所有方法（urllib3 原生语义）
+    retry_all = create_retry(allowed_methods=None)
+    assert retry_all.allowed_methods is None
+
+    # 单字符串报错（避免 'GET' 被当成 {'G', 'E', 'T'}）
+    with pytest.raises(TypeError, match="must be a collection of method names, not a single string"):
+        create_retry(allowed_methods="GET")  # type: ignore[arg-type]
+
+    # 空集合报错（避免意外导致全方法重试）
+    with pytest.raises(ValueError, match="must not be empty"):
+        create_retry(allowed_methods=[])
+
